@@ -1,0 +1,10 @@
+{
+  "id": "08_field_collision",
+  "description": "Query where multiple fields match the same dimension slot",
+  "user_query": "Show revenue by date",
+  "expected_turn_type": "answer",
+  "expected_ambiguity_type": null,
+  "expected_explore": null,
+  "expected_fields_pattern": ["revenue", "date"],
+  "notes": "Multiple date fields exist. System should pick the most relevant or clarify."
+}

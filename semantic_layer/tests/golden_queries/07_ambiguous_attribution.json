@@ -1,0 +1,11 @@
+{
+  "id": "07_ambiguous_attribution",
+  "description": "Query that should trigger attribution ambiguity clarification",
+  "user_query": "Which marketing channel drives the most revenue?",
+  "expected_turn_type": "clarification",
+  "expected_ambiguity_type": "attribution",
+  "expected_options_contain": ["first", "last"],
+  "expected_explore": null,
+  "expected_fields_pattern": null,
+  "notes": "Must NOT generate query. Must ask clarification first."
+}

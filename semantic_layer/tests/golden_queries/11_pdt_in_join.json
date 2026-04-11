@@ -1,0 +1,10 @@
+{
+  "id": "11_pdt_in_join",
+  "description": "Query involving a persistent derived table",
+  "user_query": "Show me user acquisition source with revenue",
+  "expected_turn_type": "answer",
+  "expected_ambiguity_type": null,
+  "expected_explore": null,
+  "expected_fields_pattern": ["acquisition", "revenue"],
+  "notes": "Should include PDT freshness note in warnings."
+}

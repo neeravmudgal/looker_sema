@@ -1,0 +1,10 @@
+{
+  "id": "09_no_match",
+  "description": "Query with no matching fields in the model",
+  "user_query": "What is the weather forecast for tomorrow?",
+  "expected_turn_type": "no_match",
+  "expected_ambiguity_type": null,
+  "expected_explore": null,
+  "expected_fields_pattern": null,
+  "notes": "Completely unrelated query. Should return no_match with suggestions."
+}

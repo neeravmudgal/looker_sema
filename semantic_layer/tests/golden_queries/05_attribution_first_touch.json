@@ -1,0 +1,10 @@
+{
+  "id": "05_attribution_first_touch",
+  "description": "Explicit first touch attribution query",
+  "user_query": "Which channel first acquired our highest revenue customers?",
+  "expected_turn_type": "answer",
+  "expected_ambiguity_type": null,
+  "expected_explore": null,
+  "expected_fields_pattern": ["acquisition", "revenue"],
+  "notes": "Word 'acquired' should hint first_touch. No clarification needed."
+}

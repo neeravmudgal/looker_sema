@@ -1,0 +1,10 @@
+{
+  "id": "06_attribution_last_touch",
+  "description": "Explicit last touch attribution query",
+  "user_query": "What was the last channel before users purchased?",
+  "expected_turn_type": "answer",
+  "expected_ambiguity_type": null,
+  "expected_explore": null,
+  "expected_fields_pattern": ["purchase", "source"],
+  "notes": "'last channel before purchase' hints last_touch."
+}

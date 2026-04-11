@@ -1,0 +1,31 @@
+# ── GraphRAG Semantic Layer Dependencies ──────────────────────
+# Pinned versions for reproducible builds.
+# Install: pip install -r requirements.txt
+
+# LookML parsing
+lkml==1.3.5
+
+# Neo4j graph database driver
+neo4j==5.27.0
+neo4j-graphrag==1.4.0
+
+# Embedding and LLM providers
+openai==1.82.0
+anthropic==0.52.0
+google-genai==1.14.0
+voyageai==0.3.2
+
+# Configuration management
+pydantic==2.11.3
+pydantic-settings==2.9.1
+
+# Streamlit UI
+streamlit==1.45.1
+
+# Utilities
+python-dotenv==1.1.0
+numpy==2.2.6
+
+# Testing
+pytest==8.3.5
+pytest-asyncio==0.25.0

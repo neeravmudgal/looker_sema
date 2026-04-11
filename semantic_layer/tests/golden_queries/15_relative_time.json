@@ -1,0 +1,10 @@
+{
+  "id": "15_relative_time",
+  "description": "Various relative time expressions",
+  "user_query": "Show me revenue for year to date",
+  "expected_turn_type": "answer",
+  "expected_ambiguity_type": null,
+  "expected_explore": null,
+  "expected_fields_pattern": ["revenue"],
+  "notes": "'year to date'/'YTD' should resolve to Looker 'this year' filter."
+}

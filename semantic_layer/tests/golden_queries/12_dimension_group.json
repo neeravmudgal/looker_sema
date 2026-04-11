@@ -1,0 +1,10 @@
+{
+  "id": "12_dimension_group",
+  "description": "Query requesting specific time grain from a dimension_group",
+  "user_query": "Show sessions by week",
+  "expected_turn_type": "answer",
+  "expected_ambiguity_type": null,
+  "expected_explore": null,
+  "expected_fields_pattern": ["session", "week"],
+  "notes": "Must resolve 'by week' to the _week timeframe field, not _date."
+}

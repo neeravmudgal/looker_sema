@@ -1,0 +1,10 @@
+{
+  "id": "02_metric_plus_dimension",
+  "description": "Metric grouped by a dimension",
+  "user_query": "Show me total sessions by country",
+  "expected_turn_type": "answer",
+  "expected_ambiguity_type": null,
+  "expected_explore": null,
+  "expected_fields_pattern": ["session", "country"],
+  "notes": "Should find session count measure and country dimension in same explore."
+}

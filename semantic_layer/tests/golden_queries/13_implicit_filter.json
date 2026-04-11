@@ -1,0 +1,10 @@
+{
+  "id": "13_implicit_filter",
+  "description": "Query that hits an explore with always_filter",
+  "user_query": "Show me bounce rate by traffic source",
+  "expected_turn_type": "answer",
+  "expected_ambiguity_type": null,
+  "expected_explore": null,
+  "expected_fields_pattern": ["bounce", "traffic", "source"],
+  "notes": "If explore has always_filter, it must be included in generated query."
+}

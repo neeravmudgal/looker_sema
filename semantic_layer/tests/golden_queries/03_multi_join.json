@@ -1,0 +1,10 @@
+{
+  "id": "03_multi_join",
+  "description": "Query requiring multiple joins to satisfy",
+  "user_query": "Show revenue by user age group",
+  "expected_turn_type": "answer",
+  "expected_ambiguity_type": null,
+  "expected_explore": null,
+  "expected_fields_pattern": ["revenue", "age"],
+  "notes": "Revenue and age are in different views requiring joins."
+}

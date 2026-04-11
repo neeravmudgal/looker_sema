@@ -1,0 +1,10 @@
+{
+  "id": "01_simple_metric",
+  "description": "Simple metric query with no dimensions or filters",
+  "user_query": "What is the total revenue?",
+  "expected_turn_type": "answer",
+  "expected_ambiguity_type": null,
+  "expected_explore": null,
+  "expected_fields_pattern": ["revenue"],
+  "notes": "Should find a revenue measure and return a simple query."
+}

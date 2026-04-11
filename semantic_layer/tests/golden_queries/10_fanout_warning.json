@@ -1,0 +1,10 @@
+{
+  "id": "10_fanout_warning",
+  "description": "Query that should trigger a fanout warning",
+  "user_query": "Total ad clicks by session",
+  "expected_turn_type": "answer",
+  "expected_ambiguity_type": null,
+  "expected_explore": null,
+  "expected_fields_pattern": ["click", "session"],
+  "notes": "One-to-many join should trigger fanout warning about double-counting."
+}
