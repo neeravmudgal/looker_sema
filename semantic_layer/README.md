@@ -97,8 +97,8 @@ ambiguity, and generates valid Looker Explore query JSON.
                                                                         │
     ┌───────────────────────────────────┐  ┌────────────────────────────┤
     │     EXPLORE CONTEXT CACHE         │  │    LLM PROVIDER            │
-    │  (in-memory, built at startup)    │  │  (OpenAI / Anthropic /     │
-    │                                   │  │   Google Gemini)           │
+    │  (in-memory, built at startup)    │  │  (Ollama / OpenAI /        │
+    │                                   │  │   Anthropic / Google)       │
     │  Forward:  explore → fields+joins │  │                            │
     │  Reverse:  field_id → [explores]  │  │  Used for:                 │
     │                                   │  │  1. Intent extraction      │
@@ -162,7 +162,7 @@ fields are accessible from a single explore) to produce confident, correct resul
 - `context_assembler.py` — Builds minimal context for LLM query generation
 
 ### `src/llm/` — LLM Providers
-**What:** Unified interface over OpenAI, Anthropic, and Google Gemini.
+**What:** Unified interface over Ollama (local), OpenAI, Anthropic, and Google Gemini.
 **Why:** Users can switch providers from the UI without code changes. All prompts
 are external `.txt` files — editable without redeploying.
 **Key files:**
@@ -197,38 +197,51 @@ see how queries are constructed.
 
 ## Setup Instructions
 
+> For detailed step-by-step setup, see [BUILD.md](../BUILD.md) in the project root.
+
 ### Prerequisites
 - Python 3.10+
 - Docker (for Neo4j)
-- At least one LLM API key (OpenAI, Anthropic, or Google)
+- Ollama (for free local LLM + embeddings) — OR an API key for OpenAI / Anthropic / Google
 
 ### 1. Clone and Install
 
 ```bash
 cd semantic_layer
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
 ### 2. Start Neo4j
 
 ```bash
-docker compose up -d
-# Wait for Neo4j to be healthy:
-docker compose logs -f neo4j  # Look for "Started."
+docker pull neo4j:5.26.0-community
+
+docker run -d \
+  --name semantic-layer-neo4j \
+  -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH=neo4j/semantic_layer_dev \
+  -e NEO4J_PLUGINS='["apoc"]' \
+  -e NEO4J_dbms_security_procedures_unrestricted='apoc.*' \
+  -v neo4j_sema_data:/data \
+  -v neo4j_sema_logs:/logs \
+  neo4j:5.26.0-community
 ```
 
 Neo4j browser available at http://localhost:7474 (neo4j / semantic_layer_dev)
 
-### 3. Configure Environment
+### 3. Install Ollama Models (for local inference)
 
 ```bash
-cp .env.example .env
-# Edit .env with your API keys:
-#   OPENAI_API_KEY=sk-...
-#   LOOKML_DIR=../looker_fixtures  (path to your LookML files)
+ollama pull llama3.1:8b        # LLM for intent extraction + query generation
+ollama pull nomic-embed-text   # Embedding model for semantic search
 ```
 
-### 4. Run the App
+### 4. Configure Environment
+
+Edit `.env` in the `semantic_layer/` directory. For local-only development with Ollama, the defaults work out of the box. For cloud providers, add your API key and change the provider settings.
+
+### 5. Run the App
 
 ```bash
 cd semantic_layer
@@ -238,16 +251,16 @@ streamlit run app/streamlit_app.py
 The app will:
 1. Parse your LookML files
 2. Build the Neo4j graph
-3. Generate embeddings (requires API key)
+3. Generate embeddings (via Ollama or cloud API)
 4. Show the chat interface
 
-### 5. Run Tests
+### 6. Run Tests
 
 ```bash
 # Unit tests (no Neo4j needed)
 pytest tests/unit/ -v
 
-# Integration tests (requires running Neo4j with data)
+# Integration tests (requires running Neo4j + LLM provider)
 pytest tests/integration/ -v
 ```
 
@@ -295,13 +308,13 @@ pytest tests/integration/ -v
 
 ### "Neo4j not available"
 ```bash
-docker compose up -d
-docker compose ps  # Should show "healthy"
+docker ps --filter name=semantic-layer-neo4j   # Check if container is running
+docker start semantic-layer-neo4j              # Start if stopped
 ```
 
 ### "Embedding failed"
-Check your API key in `.env`. The system works without embeddings (falls back to
-direct assembly) but ANN search won't function.
+If using Ollama, ensure the server is running (`ollama serve`) and the model is pulled (`ollama list`).
+If using a cloud provider, check your API key in `.env`.
 
 ### "No .lkml files found"
 Check `LOOKML_DIR` in `.env`. Path is relative to the `semantic_layer/` directory.
@@ -322,8 +335,8 @@ available in each explore.
 |-----------|-----------|-----|
 | Graph Database | Neo4j 5.x | Native property graph + vector index in one DB |
 | Vector Search | Neo4j native vector index | No separate vector DB needed |
-| LLM Providers | OpenAI, Anthropic, Google | User choice, runtime switchable |
-| Embeddings | OpenAI text-embedding-3-small | Good quality/cost balance |
+| LLM Providers | Ollama, OpenAI, Anthropic, Google | Local or cloud, runtime switchable |
+| Embeddings | Ollama (nomic-embed-text) or OpenAI | Local-first, cloud optional |
 | LookML Parsing | lkml library | Official Looker-maintained parser |
 | UI | Streamlit | Rapid prototyping, built-in chat components |
 | Config | pydantic-settings | Type-safe, .env-based, fail-fast |
@@ -339,5 +352,5 @@ semantic_layer/
 ├── app/           ~500 lines across 5 UI components
 ├── tests/         ~800 lines across 7 test files + 15 golden queries
 ├── prompts/       4 external prompt templates
-└── config/        requirements.txt, docker-compose.yml, .env.example
+└── config/        requirements.txt, .env
 ```
