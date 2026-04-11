@@ -6,114 +6,121 @@ ambiguity, and generates valid Looker Explore query JSON.
 
 ---
 
-## Architecture Diagram
+## Architecture
 
+### System Overview
+
+```mermaid
+graph TB
+    subgraph UI["Streamlit Chat UI"]
+        Chat["Chat Interface"]
+        Settings["Settings Panel"]
+        Explorer["Graph Explorer"]
+    end
+
+    subgraph Conversation["Conversation Service"]
+        TH["Turn Handler<br/><i>orchestrator</i>"]
+        Session["Session<br/><i>state machine</i>"]
+    end
+
+    subgraph Pipeline["Query Pipeline"]
+        IE["Intent Extractor<br/><i>LLM call</i>"]
+        RET["Retriever<br/><i>embed + ANN + score</i>"]
+        AD["Ambiguity Detector<br/><i>attribution · collision · conflict</i>"]
+        CA["Context Assembler"]
+        QB["Query Builder<br/><i>LLM call + fallback</i>"]
+        VAL["Validator"]
+    end
+
+    subgraph Data["Data Layer"]
+        NEO["Neo4j Graph<br/><i>nodes · edges · vector indexes</i>"]
+        CACHE["Explore Cache<br/><i>in-memory, O(1) lookup</i>"]
+        LLM["LLM Provider<br/><i>Ollama · OpenAI · Anthropic · Google</i>"]
+    end
+
+    subgraph Startup["Startup (one-time)"]
+        PARSER["LookML Parser<br/><i>.lkml → dataclasses</i>"]
+        GB["Graph Builder<br/><i>batch write to Neo4j</i>"]
+        EMB["Embedder<br/><i>field + explore vectors</i>"]
+    end
+
+    Chat -->|user question| TH
+    TH --> IE
+    IE -->|structured intent| RET
+    RET -->|candidates + scores| AD
+    AD -->|ambiguous?| Session
+    Session -->|clarification| Chat
+    AD -->|clear| CA
+    CA --> QB
+    QB --> VAL
+    VAL -->|Looker query JSON| Chat
+
+    IE -.->|LLM call| LLM
+    QB -.->|LLM call| LLM
+    RET -.->|ANN search| NEO
+    RET -.->|field lookup| CACHE
+    CA -.->|full field list| CACHE
+    VAL -.->|field exists?| CACHE
+
+    PARSER --> GB --> NEO
+    NEO --> CACHE
+    NEO --> EMB
 ```
-                          ┌──────────────────────────────────────┐
-                          │         STREAMLIT CHAT UI             │
-                          │  ┌────────────┐  ┌────────────────┐  │
-                          │  │ Chat       │  │ Settings Panel │  │
-                          │  │ Interface  │  │ (LLM selector, │  │
-                          │  │            │  │  status, stats)│  │
-                          │  └─────┬──────┘  └────────────────┘  │
-                          │        │                              │
-                          │  ┌─────▼──────┐  ┌────────────────┐  │
-                          │  │ Graph      │  │ Query Display  │  │
-                          │  │ Explorer   │  │ (JSON + copy)  │  │
-                          │  └────────────┘  └────────────────┘  │
-                          └──────────┬───────────────────────────┘
-                                     │
-                          ┌──────────▼───────────────────────────┐
-                          │       CONVERSATION SERVICE            │
-                          │                                       │
-                          │  ┌─────────────┐  ┌───────────────┐  │
-                          │  │ Session     │  │ Turn Handler  │  │
-                          │  │ (state      │◄─┤ (orchestrator)│  │
-                          │  │  machine)   │  │               │  │
-                          │  └─────────────┘  └───────┬───────┘  │
-                          └───────────────────────────┼──────────┘
-                                                      │
-              ┌───────────────────────────────────────┼───────────────────┐
-              │                                       │                   │
-    ┌─────────▼──────────┐               ┌───────────▼────────┐          │
-    │  INTENT EXTRACTOR  │               │    RETRIEVER       │          │
-    │                    │               │                    │          │
-    │  User query ──────►│               │  ┌──────────────┐  │          │
-    │  Structured intent │               │  │ 1. Embed     │  │          │
-    │  {metrics,         │               │  │    intent    │  │          │
-    │   dimensions,      │               │  │ 2. ANN      │  │          │
-    │   filters,         │               │  │    search   │  │          │
-    │   time_range,      │               │  │ 3. Graph    │  │          │
-    │   attribution_hint}│               │  │    expand   │  │          │
-    └────────┬───────────┘               │  │ 4. Score    │  │          │
-             │                           │  │    explores │  │          │
-             │                           │  │ 5. Detect   │  │          │
-             │                           │  │    ambiguity│  │          │
-             │                           │  └──────────────┘  │          │
-             │                           └───────────┬────────┘          │
-             │                                       │                   │
-             │         ┌─────────────────────────────┼───────────────┐   │
-             │         │    AMBIGUITY DETECTOR       │               │   │
-             │         │                             │               │   │
-             │         │  Type 1: Attribution ◄──────┘               │   │
-             │         │  Type 2: Field Collision                    │   │
-             │         │  Type 3: Explore Conflict                   │   │
-             │         │  Type 4: Cross-Explore                      │   │
-             │         │                                             │   │
-             │         │  If ambiguous ──► Ask clarification         │   │
-             │         │  If clear ──────► Proceed to query gen      │   │
-             │         └─────────────────────────────────────────────┘   │
-             │                                                           │
-    ┌────────▼───────────────────────────────────────────────────────┐   │
-    │                    QUERY GENERATOR                              │   │
-    │                                                                 │   │
-    │  ┌──────────────┐  ┌────────────┐  ┌────────────────────────┐  │   │
-    │  │ Context      │  │ LLM Query  │  │ Validator              │  │   │
-    │  │ Assembler    ├─►│ Builder    ├─►│ - Check field exists   │  │   │
-    │  │ (minimal     │  │ (LLM call  │  │ - Route measure filters│  │   │
-    │  │  context)    │  │  or direct │  │ - Inject always_filter │  │   │
-    │  └──────────────┘  │  assembly) │  │ - Enforce limits       │  │   │
-    │                    └────────────┘  └────────────────────────┘  │   │
-    └───────────────────────────────────────────────────────────────┘   │
-                                                                        │
-    ═══════════════════════ DATA LAYER ══════════════════════════════════╪═══
-                                                                        │
-    ┌───────────────────────────────────────────────────────────────────┐│
-    │                       NEO4J GRAPH                                 ││
-    │                                                                   ││
-    │   (:Model) ──HAS_EXPLORE──► (:Explore)                           ││
-    │                                │                                  ││
-    │              ┌─────BASE_VIEW───┘──JOINS──┐                       ││
-    │              ▼                            ▼                       ││
-    │          (:View)                      (:View)                    ││
-    │              │                            │                       ││
-    │         HAS_FIELD                    HAS_FIELD                   ││
-    │              ▼                            ▼                       ││
-    │          (:Field)◄──CAN_ACCESS──(:Explore)                       ││
-    │          [embedding]                 [embedding]                  ││
-    │                                                                   ││
-    │   Vector Indexes: field_embeddings, explore_embeddings           ││
-    └───────────────────────────────────────────────────────────────────┘│
-                                                                        │
-    ┌───────────────────────────────────┐  ┌────────────────────────────┤
-    │     EXPLORE CONTEXT CACHE         │  │    LLM PROVIDER            │
-    │  (in-memory, built at startup)    │  │  (Ollama / OpenAI /        │
-    │                                   │  │   Anthropic / Google)       │
-    │  Forward:  explore → fields+joins │  │                            │
-    │  Reverse:  field_id → [explores]  │  │  Used for:                 │
-    │                                   │  │  1. Intent extraction      │
-    │  O(1) lookup, thread-safe         │  │  2. Query generation       │
-    └───────────────────────────────────┘  │  3. Explanations           │
-                                           └────────────────────────────┘
 
-    ┌───────────────────────────────────────────────────────────────────┐
-    │                    LOOKML PARSER                                   │
-    │                                                                   │
-    │  .lkml files ──► lkml library ──► Normalize ──► Graph Builder    │
-    │                                                                   │
-    │  Handles: dimension_group expansion, extends inheritance,         │
-    │           field set restrictions, PDT detection, always_filter    │
-    └───────────────────────────────────────────────────────────────────┘
+### Neo4j Graph Schema
+
+```mermaid
+graph LR
+    M["(:Model)"] -->|HAS_EXPLORE| E["(:Explore)<br/><i>+ embedding</i>"]
+    E -->|BASE_VIEW| V1["(:View)"]
+    E -->|JOINS| V2["(:View)"]
+    V1 -->|HAS_FIELD| F1["(:Field)<br/><i>+ embedding</i>"]
+    V2 -->|HAS_FIELD| F2["(:Field)<br/><i>+ embedding</i>"]
+    E -->|CAN_ACCESS| F1
+    E -->|CAN_ACCESS| F2
+    V2 -.->|EXTENDS| V1
+```
+
+### Query Pipeline Detail
+
+```mermaid
+flowchart LR
+    Q["User Question"] --> S1
+
+    subgraph S1["1. Intent Extraction"]
+        direction TB
+        LLM1["LLM Call"] --> Intent["metrics · dimensions<br/>filters · time_range<br/>attribution_hint"]
+    end
+
+    S1 --> S2
+
+    subgraph S2["2. Retrieval"]
+        direction TB
+        Embed["Embed intent string"] --> ANN["ANN search<br/>top-k fields"]
+        ANN --> Score["Score explores<br/>by field coverage"]
+    end
+
+    S2 --> S3
+
+    subgraph S3["3. Ambiguity Check"]
+        direction TB
+        A1["Attribution?"]
+        A2["Explore conflict?"]
+        A3["Field collision?"]
+    end
+
+    S3 -->|clear| S4
+    S3 -->|ambiguous| Clarify["Ask user to clarify"]
+    Clarify -->|user responds| S2
+
+    subgraph S4["4. Query Generation"]
+        direction TB
+        Ctx["Assemble context<br/><i>all fields in explore</i>"] --> LLM2["LLM generates query"]
+        LLM2 --> Val["Validate fields exist"]
+        Val --> Fallback["Fallback: direct assembly"]
+    end
+
+    S4 --> Result["Looker Query JSON<br/>+ explanation + warnings"]
 ```
 
 ---

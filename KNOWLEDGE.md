@@ -36,35 +36,19 @@ The system translates natural language questions into Looker Explore query JSON.
 
 ### Pipeline Diagram
 
-```
-User Question
-    |
-    v
-[1. Intent Extraction] --- LLM call ---> structured intent (metrics, dimensions, filters)
-    |
-    v
-[2. Embed Intent] --- Embedding API ---> query vector (768 or 1536 dims)
-    |
-    v
-[3. ANN Search] --- Neo4j vector index ---> top-k candidate fields with similarity scores
-    |
-    v
-[4. Explore Scoring] --- in-memory cache ---> score each explore by field coverage
-    |
-    v
-[5. Ambiguity Detection] ---> if ambiguous, ask user to clarify (multi-turn)
-    |
-    v
-[6. Context Assembly] --- cache ---> full explore context (all fields, joins, metadata)
-    |
-    v
-[7. Query Generation] --- LLM call ---> Looker query JSON
-    |
-    v
-[8. Validation] --- cache ---> verify all fields exist in the explore
-    |
-    v
-Looker Query JSON + Explanation + Warnings
+```mermaid
+flowchart TD
+    Q["User Question"] --> IE["1. Intent Extraction<br/><i>LLM call → structured intent</i>"]
+    IE --> EMB["2. Embed Intent<br/><i>Embedding API → query vector</i>"]
+    EMB --> ANN["3. ANN Search<br/><i>Neo4j vector index → top-k candidates</i>"]
+    ANN --> SCORE["4. Explore Scoring<br/><i>in-memory cache → score by coverage</i>"]
+    SCORE --> AMB{"5. Ambiguity<br/>Detection"}
+    AMB -->|ambiguous| CLARIFY["Ask user to clarify<br/><i>multi-turn</i>"]
+    CLARIFY --> SCORE
+    AMB -->|clear| CTX["6. Context Assembly<br/><i>cache → all fields + joins</i>"]
+    CTX --> GEN["7. Query Generation<br/><i>LLM call → Looker query JSON</i>"]
+    GEN --> VAL["8. Validation<br/><i>cache → verify fields exist</i>"]
+    VAL --> OUT["Looker Query JSON<br/>+ Explanation + Warnings"]
 ```
 
 ### Key Design Decisions
