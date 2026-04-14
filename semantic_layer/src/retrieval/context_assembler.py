@@ -168,19 +168,35 @@ class ContextAssembler:
         """
         Format the retriever's top picks as a hint for the LLM.
 
-        This tells the LLM: "Based on semantic search, these fields are
-        most relevant to the user's question. Start with these."
+        This tells the LLM: "Based on semantic and keyword search, these
+        fields are most relevant to the user's question. Start with these,
+        but you can use ANY field from the Available Fields list."
         """
         if not selected_fields:
             return "No specific field recommendations."
 
-        lines = ["Retrieval recommends these fields (most relevant to the question):"]
-        for f in selected_fields:
-            if f.field_type == "dimension_group":
-                continue
-            fqn = f"{f.view_name}.{f.name}"
-            desc = f" — {f.description[:60]}" if f.description else ""
-            lines.append(f"  ★ {fqn} ({f.field_type}){desc}")
+        lines = [
+            "Retrieval recommends these fields (most relevant to the question).",
+            "Start with these, but use ANY field from the Available Fields list if better.",
+        ]
+        # Group by type: measures first, then dimensions
+        measures = [f for f in selected_fields if f.field_type == "measure"]
+        dims = [f for f in selected_fields if f.field_type == "dimension"]
+
+        if measures:
+            lines.append("\nMeasures:")
+            for f in measures[:8]:
+                fqn = f"{f.view_name}.{f.name}"
+                desc = f" — {f.description[:60]}" if f.description else ""
+                lines.append(f"  ★ {fqn}{desc}")
+
+        if dims:
+            lines.append("\nDimensions:")
+            for f in dims[:8]:
+                fqn = f"{f.view_name}.{f.name}"
+                desc = f" — {f.description[:60]}" if f.description else ""
+                lines.append(f"  ★ {fqn}{desc}")
+
         return "\n".join(lines)
 
     def _format_joins(self, joins: List[dict]) -> str:

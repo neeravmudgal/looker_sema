@@ -33,8 +33,12 @@ $available_tags
 {
     "metrics": [
         "A list of metric/measure concepts the user wants to see.",
-        "Use the semantic tags above, not raw field names.",
-        "Example: ['total_revenue', 'order_count']"
+        "IMPORTANT: Always preserve the aggregation type in the name.",
+        "If the user says 'average age', write 'average_age' NOT 'user_age'.",
+        "If the user says 'total revenue', write 'total_revenue' NOT 'revenue'.",
+        "If the user says 'count of users', write 'user_count' NOT 'users'.",
+        "The aggregation word (average, total, count, sum, min, max) is critical.",
+        "Example: ['total_revenue', 'order_count', 'average_age', 'bounce_rate']"
     ],
     "dimensions": [
         "A list of grouping/breakdown concepts.",
@@ -91,17 +95,27 @@ marketing, acquisition, or conversion paths.
 1. Be precise with metrics vs. dimensions. If the user says "revenue by
    region", then "revenue" is a metric and "region" is a dimension.
 
-2. Infer time_range from context. "Last month's sales" → period="last month".
+2. ALWAYS include the aggregation word in metric names. This is critical
+   for downstream field matching:
+   - "average age" → metric: "average_age" (NOT "user_age" or "age")
+   - "total revenue" → metric: "total_revenue" (NOT "revenue")
+   - "count of sessions" → metric: "session_count" (NOT "sessions")
+   - "bounce rate" → metric: "bounce_rate"
+   - "max sale price" → metric: "max_sale_price"
+   The aggregation word (average, total, count, sum, min, max, rate) tells
+   the system which specific pre-computed measure field to use.
+
+3. Infer time_range from context. "Last month's sales" → period="last month".
    "Weekly trend" → grain="week". If no time context, set time_range to null.
 
-3. Map the user's words to the closest available semantic tags. If no tag
+4. Map the user's words to the closest available semantic tags. If no tag
    matches, use a descriptive concept name anyway — downstream retrieval
    will do fuzzy matching.
 
-4. When in doubt about intent_type, prefer "aggregation" — it is the safest
+5. When in doubt about intent_type, prefer "aggregation" — it is the safest
    default that produces useful results.
 
-5. Filters should capture explicit constraints the user stated.
+6. Filters should capture explicit constraints the user stated.
    "Active customers" → filter on status = "active".
    "Orders over $100" → filter on order_total > "100".
 

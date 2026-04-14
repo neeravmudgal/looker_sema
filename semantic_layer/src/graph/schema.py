@@ -59,6 +59,22 @@ INDEXES: List[str] = [
     "CREATE INDEX field_hidden_idx IF NOT EXISTS FOR (f:Field) ON (f.is_hidden)",
 ]
 
+# Full-text indexes for hybrid retrieval (exact keyword + vector semantic)
+FULLTEXT_INDEXES: List[str] = [
+    # Hybrid search: find fields by exact name/label/description keywords
+    # Complements vector search which finds semantic matches
+    "CREATE FULLTEXT INDEX field_fulltext IF NOT EXISTS "
+    "FOR (f:Field) ON EACH [f.name, f.label, f.description]",
+
+    # Search explores by name/description
+    "CREATE FULLTEXT INDEX explore_fulltext IF NOT EXISTS "
+    "FOR (e:Explore) ON EACH [e.name, e.label, e.description]",
+
+    # Search views by name
+    "CREATE FULLTEXT INDEX view_fulltext IF NOT EXISTS "
+    "FOR (v:View) ON EACH [v.name, v.view_label]",
+]
+
 def _vector_indexes() -> List[str]:
     """
     Build vector index DDL at runtime so it reads the current settings.
@@ -80,6 +96,13 @@ def _vector_indexes() -> List[str]:
 
         f"""CREATE VECTOR INDEX explore_embeddings IF NOT EXISTS
         FOR (e:Explore) ON (e.embedding)
+        OPTIONS {{indexConfig: {{
+          `vector.dimensions`: {dims},
+          `vector.similarity_function`: 'cosine'
+        }}}}""",
+
+        f"""CREATE VECTOR INDEX view_embeddings IF NOT EXISTS
+        FOR (v:View) ON (v.embedding)
         OPTIONS {{indexConfig: {{
           `vector.dimensions`: {dims},
           `vector.similarity_function`: 'cosine'
@@ -107,6 +130,9 @@ def create_schema(driver: Driver) -> None:
 
         for stmt in INDEXES:
             _execute_ddl(session, stmt, "index")
+
+        for stmt in FULLTEXT_INDEXES:
+            _execute_ddl(session, stmt, "fulltext index")
 
         for stmt in _vector_indexes():
             _execute_ddl(session, stmt, "vector index")

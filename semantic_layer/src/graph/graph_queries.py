@@ -134,6 +134,26 @@ RETURN field.name        AS field_name,
 ORDER BY score DESC
 """
 
+# Pre-filtered variant: only search measures or dimensions
+ANN_SEARCH_FIELDS_FILTERED = """
+CALL db.index.vector.queryNodes('field_embeddings', $k, $embedding)
+YIELD node AS field, score
+WHERE field.is_hidden = false
+  AND ($field_type IS NULL OR field.field_type = $field_type)
+RETURN field.name        AS field_name,
+       field.view_name   AS view_name,
+       field.explore_name AS explore_name,
+       field.field_type  AS field_type,
+       field.data_type   AS data_type,
+       field.label       AS label,
+       field.description AS description,
+       field.tags        AS tags,
+       field.sql         AS sql,
+       field.model_name  AS model_name,
+       score
+ORDER BY score DESC
+"""
+
 ANN_SEARCH_EXPLORES = """
 CALL db.index.vector.queryNodes('explore_embeddings', $k, $embedding)
 YIELD node AS explore, score
@@ -144,6 +164,66 @@ RETURN explore.name        AS explore_name,
        explore.description AS description,
        score
 ORDER BY score DESC
+"""
+
+# ── View vector search ───────────────────────────────────────────────
+ANN_SEARCH_VIEWS = """
+CALL db.index.vector.queryNodes('view_embeddings', $k, $embedding)
+YIELD node AS view, score
+RETURN view.name AS view_name,
+       view.view_label AS view_label,
+       score
+ORDER BY score DESC
+"""
+
+# ── Full-text search (hybrid complement to vector search) ────────────
+# Exact keyword matching: finds fields by name/label/description keywords.
+# Vector search finds "semantically similar" — fulltext finds "literally contains".
+# Together they cover both fuzzy intent and precise field name references.
+
+FULLTEXT_SEARCH_FIELDS = """
+CALL db.index.fulltext.queryNodes('field_fulltext', $query)
+YIELD node AS field, score
+WHERE field.is_hidden = false
+RETURN field.name        AS field_name,
+       field.view_name   AS view_name,
+       field.explore_name AS explore_name,
+       field.field_type  AS field_type,
+       field.data_type   AS data_type,
+       field.label       AS label,
+       field.description AS description,
+       field.tags        AS tags,
+       field.sql         AS sql,
+       field.model_name  AS model_name,
+       score
+ORDER BY score DESC
+LIMIT $k
+"""
+
+# ── GraphRAG: Graph traversal from vector-matched fields ─────────────
+# VectorCypherRetriever pattern: after ANN finds candidate fields,
+# traverse the graph to pull in sibling fields from the same view.
+# This enriches retrieval with structured context that pure vector
+# search misses — e.g. finding "revenue" also surfaces "net_profit"
+# and "ROI" from the same view.
+
+TRAVERSE_FROM_FIELD = """
+MATCH (matched:Field {name: $field_name, view_name: $view_name, explore_name: $explore_name})
+MATCH (v:View {name: matched.view_name})-[:HAS_FIELD]->(sibling:Field)
+WHERE sibling.is_hidden = false
+  AND sibling.explore_name = $explore_name
+  AND sibling.name <> matched.name
+RETURN sibling.name        AS field_name,
+       sibling.view_name   AS view_name,
+       sibling.explore_name AS explore_name,
+       sibling.field_type  AS field_type,
+       sibling.data_type   AS data_type,
+       sibling.label       AS label,
+       sibling.description AS description,
+       sibling.tags        AS tags,
+       sibling.sql         AS sql,
+       sibling.model_name  AS model_name
+ORDER BY sibling.field_type, sibling.name
 """
 
 # ── Explore context (for cache building and context assembly) ─────────

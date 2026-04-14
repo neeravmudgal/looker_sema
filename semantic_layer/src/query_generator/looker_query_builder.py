@@ -8,13 +8,6 @@ DESIGN:
   We validate the LLM output against the explore's field catalog.
   If the LLM fails, we fall back to direct assembly from retrieval results.
 
-WHY LLM FOR QUERY GENERATION:
-  The LLM understands nuance that retrieval can't capture:
-  - "top 5 channels" → needs limit=5 + sort desc
-  - "revenue trend by month" → needs a month grain field + sort by date asc
-  - "users who spent > $500" → needs a having_filter on a measure
-  These decisions require understanding intent, not just field matching.
-
 CALLED BY: turn_handler.py
 CALLS: LLM provider for query generation, cache for validation
 """
@@ -62,15 +55,7 @@ LOOKER_TIME_FILTERS = {
 
 
 class LookerQueryBuilder:
-    """
-    Builds Looker queries by giving the LLM full explore context.
-
-    Flow:
-    1. LLM gets: all fields in explore + retrieval hints + user intent
-    2. LLM generates: complete query JSON with fields, filters, sorts
-    3. We validate: every field the LLM chose actually exists in the explore
-    4. Fallback: if LLM fails, build directly from retrieval results
-    """
+    """Builds Looker queries by giving the LLM full explore context."""
 
     def __init__(self, cache: ExploreContextCache, llm: LLMProvider):
         self._cache = cache
@@ -84,22 +69,17 @@ class LookerQueryBuilder:
         context: dict,
         user_query: str,
     ) -> dict:
-        """
-        Build a Looker query. LLM-first, with direct assembly fallback.
-        """
+        """Build a Looker query. LLM-first, with direct assembly fallback."""
         warnings: List[str] = []
 
         # ── Try 1: LLM generates the query ───────────────────────
         query = self._generate_via_llm(context, user_query)
 
         if query:
-            # Normalize keys (LLM might say "view" instead of "explore")
             query = self._normalize_keys(query, result, context)
-            # Validate fields against the explore
             query, validation_warnings = self._validate_fields(query, result.explore_name)
             warnings.extend(validation_warnings)
 
-            # If LLM query has fields, use it
             if query.get("fields"):
                 query["_warnings"] = warnings
                 query["_confidence"] = result.confidence_score
@@ -116,16 +96,7 @@ class LookerQueryBuilder:
         return query
 
     def _generate_via_llm(self, context: dict, user_query: str) -> Optional[dict]:
-        """
-        Send the full explore context to the LLM and get a query back.
-
-        The prompt includes:
-        - All fields in the explore (the full menu)
-        - Retrieval hints (★ marked fields)
-        - The user's intent
-        - Time filter value (pre-resolved)
-        - Always filters
-        """
+        """Send the full explore context to the LLM and get a query back."""
         if not self._prompt_template:
             return None
 
@@ -143,7 +114,6 @@ class LookerQueryBuilder:
                 time_filter_value=context.get("time_filter_value", ""),
             )
 
-            # Add the retrieval hint if available
             retrieval_hint = context.get("retrieval_hint", "")
             if retrieval_hint:
                 prompt += f"\n\n## Retrieval Hint\n{retrieval_hint}"
@@ -165,16 +135,11 @@ class LookerQueryBuilder:
         return None
 
     def _normalize_keys(self, query: dict, result: RetrievalResult, context: dict) -> dict:
-        """
-        Fix common LLM output inconsistencies:
-        - "view" → "explore"
-        - Wrong model name
-        - having_filters as list → dict
-        """
+        """Fix common LLM output inconsistencies."""
         # Fix explore key
         if "explore" not in query or not query.get("explore"):
             query["explore"] = query.pop("view", "") or result.explore_name or ""
-        query.pop("view", None)  # Remove "view" if it still exists alongside "explore"
+        query.pop("view", None)
 
         # Ensure explore is valid
         valid_explores = set(self._cache.all_explore_names())
@@ -205,17 +170,20 @@ class LookerQueryBuilder:
                         new_hf[dim] = expr
             query["having_filters"] = new_hf
 
+        # Strip any non-standard keys the LLM may have invented
+        valid_keys = {"explore", "model", "fields", "filters", "having_filters",
+                      "sorts", "limit", "explanation"}
+        for key in list(query.keys()):
+            if key not in valid_keys and not key.startswith("_"):
+                logger.warning("Removing non-standard LLM key: '%s'", key)
+                query.pop(key)
+
         return query
 
     def _validate_fields(
         self, query: dict, explore_name: str
     ) -> tuple:
-        """
-        Validate every field in the LLM's query against the explore's catalog.
-
-        Returns (cleaned_query, warnings_list).
-        Fields not found in the explore are removed with a warning.
-        """
+        """Validate every field in the LLM's query against the explore's catalog."""
         warnings = []
 
         if not explore_name:
@@ -226,13 +194,11 @@ class LookerQueryBuilder:
             warnings.append(f"Explore '{explore_name}' not found in cache.")
             return query, warnings
 
-        # Build the set of all valid FQNs in this explore
         valid_fqns = set()
         for f in ctx.get("fields", []):
             if not f.is_hidden and f.field_type != "dimension_group":
                 valid_fqns.add(f"{f.view_name}.{f.name}")
 
-        # Validate query fields
         valid_query_fields = []
         for fqn in query.get("fields", []):
             if fqn in valid_fqns:
@@ -242,7 +208,6 @@ class LookerQueryBuilder:
                 warnings.append(f"Removed '{fqn}' — not found in explore.")
         query["fields"] = valid_query_fields
 
-        # Validate filter targets
         for key in ("filters", "having_filters"):
             valid_filters = {}
             for fqn, val in query.get(key, {}).items():
@@ -252,7 +217,6 @@ class LookerQueryBuilder:
                     logger.warning("Removed filter on '%s'", fqn)
             query[key] = valid_filters
 
-        # Validate sorts
         valid_sorts = []
         for sort_expr in query.get("sorts", []):
             fqn = sort_expr.strip().split()[0]
@@ -260,7 +224,6 @@ class LookerQueryBuilder:
                 valid_sorts.append(sort_expr)
         query["sorts"] = valid_sorts
 
-        # Enforce limit
         limit = query.get("limit", 500)
         try:
             limit = int(limit)
@@ -273,12 +236,7 @@ class LookerQueryBuilder:
     def _assemble_directly(
         self, result: RetrievalResult, intent: dict, context: dict
     ) -> dict:
-        """
-        Fallback: build query directly from retrieval results (no LLM).
-
-        Uses the retriever's selected fields, adds time filters and sorting.
-        Always produces a valid query (fields are from the cache).
-        """
+        """Fallback: build query directly from retrieval results (no LLM)."""
         query = {
             "explore": result.explore_name or "",
             "model": result.model_name or "",
@@ -290,7 +248,6 @@ class LookerQueryBuilder:
             "explanation": "",
         }
 
-        # Add retrieved fields (guaranteed valid — came from the cache)
         for field in result.selected_fields:
             if field.field_type == "dimension_group":
                 continue
@@ -298,7 +255,6 @@ class LookerQueryBuilder:
             if fqn not in query["fields"]:
                 query["fields"].append(fqn)
 
-        # Add time filter
         time_range = intent.get("time_range", {})
         period = time_range.get("period", "")
         if period:
@@ -309,13 +265,11 @@ class LookerQueryBuilder:
                 if date_field:
                     query["filters"][date_field] = time_value
 
-        # Sort by first measure descending
         measures = [f for f in result.selected_fields if f.field_type == "measure"]
         if measures:
             fqn = f"{measures[0].view_name}.{measures[0].name}"
             query["sorts"].append(f"{fqn} desc")
 
-        # Inject always_filters
         af_str = context.get("always_filters", "none")
         if af_str and af_str != "none":
             try:
@@ -326,7 +280,6 @@ class LookerQueryBuilder:
             except (json.JSONDecodeError, TypeError):
                 pass
 
-        # Fallback explanation
         field_names = query["fields"][:5]
         query["explanation"] = (
             f"This query uses the **{result.explore_name}** explore. "

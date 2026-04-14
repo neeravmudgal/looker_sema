@@ -28,7 +28,7 @@ from neo4j import Driver
 
 from src.config import settings
 from src.parser.models import LookMLField, LookMLExplore
-from src.embeddings.strategies import format_field_text, format_explore_text
+from src.embeddings.strategies import format_field_text, format_explore_text, format_view_text
 
 logger = logging.getLogger(__name__)
 
@@ -86,23 +86,30 @@ class Embedder:
         self,
         fields: List[LookMLField],
         explore_contexts: Dict[str, dict],
+        views: Optional[Dict] = None,
     ) -> Dict[str, int]:
         """
-        Embed all fields and explores, store vectors on Neo4j nodes.
+        Embed all fields, explores, and views, store vectors on Neo4j nodes.
 
         Args:
             fields: All LookMLField objects to embed (typically from cache.all_fields())
             explore_contexts: Dict of explore_name → context dict (from cache)
+            views: Dict of view_name → LookMLView (optional, for view embeddings)
 
         Returns:
-            {"fields_embedded": n, "explores_embedded": m, "skipped": k}
+            {"fields_embedded": n, "explores_embedded": m, "views_embedded": v, "skipped": k}
         """
         stats = {"fields_embedded": 0, "explores_embedded": 0, "skipped": 0}
 
-        # ── Embed fields ──────────────────────────────────────────
-        # Build texts and hashes, skip fields that haven't changed
-        field_texts = []
-        field_keys = []  # (name, view_name, explore_name) tuples for Neo4j lookup
+        # ── Embed fields (deduplicated) ───────────────────────────
+        # Same field (name+view) exists as separate nodes per explore,
+        # but the embedding text is identical (explore_name excluded).
+        # We embed each unique (name, view_name) ONCE and copy the vector
+        # to all explore-scoped copies. This halves API calls and ensures
+        # ANN search returns diverse fields instead of duplicates.
+        unique_texts = {}   # (name, view_name) → text
+        unique_hashes = {}  # (name, view_name) → hash
+        all_field_keys = [] # All (name, view_name, explore_name) for storage
 
         for field in fields:
             if field.field_type == "dimension_group":
@@ -110,22 +117,51 @@ class Embedder:
                 stats["skipped"] += 1
                 continue
 
-            text = format_field_text(field)
-            text_hash = hashlib.sha256(text.encode()).hexdigest()
-
-            field_texts.append(text)
-            field_keys.append({
+            key = (field.name, field.view_name)
+            all_field_keys.append({
                 "name": field.name,
                 "view_name": field.view_name,
                 "explore_name": field.explore_name,
-                "text_hash": text_hash,
             })
 
-        if field_texts:
-            logger.info("Embedding %d fields...", len(field_texts))
-            embeddings = self._embed_batch(field_texts)
-            self._store_field_embeddings(field_keys, embeddings)
-            stats["fields_embedded"] = len(embeddings)
+            if key not in unique_texts:
+                text = format_field_text(field)
+                unique_texts[key] = text
+                unique_hashes[key] = hashlib.sha256(text.encode()).hexdigest()
+
+        # Embed only unique fields
+        unique_keys_ordered = list(unique_texts.keys())
+        unique_texts_ordered = [unique_texts[k] for k in unique_keys_ordered]
+
+        if unique_texts_ordered:
+            logger.info(
+                "Embedding %d unique fields (from %d total, %.0f%% dedup savings)...",
+                len(unique_texts_ordered), len(all_field_keys),
+                (1 - len(unique_texts_ordered) / max(len(all_field_keys), 1)) * 100,
+            )
+            unique_embeddings = self._embed_batch(unique_texts_ordered)
+
+            # Build lookup: (name, view_name) → embedding
+            embedding_lookup = {}
+            for i, key in enumerate(unique_keys_ordered):
+                embedding_lookup[key] = unique_embeddings[i]
+
+            # Store: copy the same embedding to every explore-scoped node
+            store_batch = []
+            for fk in all_field_keys:
+                key = (fk["name"], fk["view_name"])
+                store_batch.append({
+                    "name": fk["name"],
+                    "view_name": fk["view_name"],
+                    "explore_name": fk["explore_name"],
+                    "text_hash": unique_hashes[key],
+                })
+
+            self._store_field_embeddings(store_batch, [
+                embedding_lookup[(fk["name"], fk["view_name"])] for fk in all_field_keys
+            ])
+            stats["fields_embedded"] = len(all_field_keys)
+            stats["unique_embedded"] = len(unique_texts_ordered)
 
         # ── Embed explores ────────────────────────────────────────
         explore_texts = []
@@ -161,9 +197,36 @@ class Embedder:
             self._store_explore_embeddings(explore_keys, embeddings)
             stats["explores_embedded"] = len(embeddings)
 
+        # ── Embed views ──────────────────────────────────────────
+        stats["views_embedded"] = 0
+        if views:
+            view_texts = []
+            view_keys = []
+
+            for view_name, view_obj in views.items():
+                text = format_view_text(
+                    view_name=view_name,
+                    fields=view_obj.fields,
+                    sql_table_name=view_obj.sql_table_name or "",
+                    view_label=view_obj.view_label or "",
+                )
+                text_hash = hashlib.sha256(text.encode()).hexdigest()
+                view_texts.append(text)
+                view_keys.append({
+                    "name": view_name,
+                    "text_hash": text_hash,
+                })
+
+            if view_texts:
+                logger.info("Embedding %d views...", len(view_texts))
+                embeddings = self._embed_batch(view_texts)
+                self._store_view_embeddings(view_keys, embeddings)
+                stats["views_embedded"] = len(embeddings)
+
         logger.info(
-            "Embedding complete: %d fields, %d explores, %d skipped",
-            stats["fields_embedded"], stats["explores_embedded"], stats["skipped"],
+            "Embedding complete: %d fields, %d explores, %d views, %d skipped",
+            stats["fields_embedded"], stats["explores_embedded"],
+            stats["views_embedded"], stats["skipped"],
         )
         return stats
 
@@ -297,6 +360,31 @@ class Embedder:
                 MATCH (e:Explore {name: b.name, model_name: b.model_name})
                 SET e.embedding = b.embedding,
                     e.embedding_hash = b.embedding_hash
+                """,
+                batch=batch,
+            )
+
+    def _store_view_embeddings(
+        self,
+        view_keys: List[dict],
+        embeddings: List[List[float]],
+    ) -> None:
+        """Write embedding vectors back to View nodes in Neo4j."""
+        with self._driver.session() as session:
+            batch = []
+            for i, key in enumerate(view_keys):
+                batch.append({
+                    "name": key["name"],
+                    "embedding": embeddings[i],
+                    "embedding_hash": key["text_hash"],
+                })
+
+            session.run(
+                """
+                UNWIND $batch AS b
+                MATCH (v:View {name: b.name})
+                SET v.embedding = b.embedding,
+                    v.embedding_hash = b.embedding_hash
                 """,
                 batch=batch,
             )

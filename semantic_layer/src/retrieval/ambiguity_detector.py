@@ -309,9 +309,33 @@ class AmbiguityDetector:
 
         Triggered when the top-2 explores have scores within
         ambiguity_threshold of each other.
+
+        SKIP if the user explicitly named an explore in their query
+        (e.g. "in events", "from sessions", "using events explore").
         """
         if len(explore_scores) < 2:
             return AmbiguityResult()
+
+        # Check if user explicitly mentioned an explore name in the query.
+        # If so, there's no ambiguity — they told us which one they want.
+        query_lower = user_query.lower()
+        for explore_name in explore_scores:
+            # Match patterns like "in events", "from sessions", "using events",
+            # "events explore", or just the explore name surrounded by word boundaries
+            name_lower = explore_name.lower()
+            explicit_patterns = [
+                rf"\bin\s+{re.escape(name_lower)}\b",
+                rf"\bfrom\s+{re.escape(name_lower)}\b",
+                rf"\busing\s+{re.escape(name_lower)}\b",
+                rf"\b{re.escape(name_lower)}\s+explore\b",
+                rf"\b{re.escape(name_lower)}\s+data\b",
+            ]
+            if any(re.search(p, query_lower) for p in explicit_patterns):
+                logger.info(
+                    "User explicitly mentioned explore '%s' in query, skipping explore conflict",
+                    explore_name,
+                )
+                return AmbiguityResult()
 
         sorted_explores = sorted(
             explore_scores.items(), key=lambda x: x[1], reverse=True

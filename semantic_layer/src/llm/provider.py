@@ -116,6 +116,11 @@ class LLMProvider:
         self._input_tokens: int = 0
         self._output_tokens: int = 0
 
+        # --- Prompt log ---
+        # Stores every (system, user, response) tuple so the UI can display
+        # exactly what went to the LLM at each step. List of dicts.
+        self._prompt_log: list = []
+
         # --- Lazy client initialisation ---
         # We create the vendor client once and reuse it. Each vendor SDK
         # manages its own connection pool internally.
@@ -369,6 +374,29 @@ class LLMProvider:
     # Internal: per-provider dispatch
     # ------------------------------------------------------------------
 
+    def get_prompt_log(self) -> list:
+        """
+        Return the full log of all LLM calls made this session.
+
+        Each entry is a dict:
+        {
+            "call_number": int,
+            "system_prompt": str,
+            "user_prompt": str,
+            "raw_response": str,
+            "json_mode": bool,
+        }
+
+        WHY: Debugging query generation requires seeing exactly what the
+        LLM received and returned. The Streamlit UI renders these in
+        collapsible expanders under each pipeline stage.
+        """
+        return list(self._prompt_log)
+
+    def clear_prompt_log(self) -> None:
+        """Clear the prompt log (called at the start of each turn)."""
+        self._prompt_log.clear()
+
     def _dispatch(
         self,
         *,
@@ -385,16 +413,27 @@ class LLMProvider:
         usage in slightly different shapes; we normalise here.
         """
         if self.provider == "openai":
-            return self._call_openai(system, user, temperature, max_tokens, json_mode)
+            raw = self._call_openai(system, user, temperature, max_tokens, json_mode)
         elif self.provider == "anthropic":
-            return self._call_anthropic(system, user, temperature, max_tokens, json_mode)
+            raw = self._call_anthropic(system, user, temperature, max_tokens, json_mode)
         elif self.provider == "google":
-            return self._call_google(system, user, temperature, max_tokens, json_mode)
+            raw = self._call_google(system, user, temperature, max_tokens, json_mode)
         elif self.provider == "ollama":
-            return self._call_ollama(system, user, temperature, max_tokens, json_mode)
+            raw = self._call_ollama(system, user, temperature, max_tokens, json_mode)
         else:
             # Defensive — should never happen because __init__ validates.
             raise LLMError(f"Unknown provider: {self.provider}")
+
+        # Log the full prompt + response for UI debugging
+        self._prompt_log.append({
+            "call_number": len(self._prompt_log) + 1,
+            "system_prompt": system,
+            "user_prompt": user,
+            "raw_response": raw,
+            "json_mode": json_mode,
+        })
+
+        return raw
 
     # ---- OpenAI --------------------------------------------------------
 
@@ -629,11 +668,11 @@ def _extract_json(raw: str) -> dict:
     """
     Parse a JSON dict from a string, stripping common LLM artifacts.
 
-    LLMs sometimes wrap JSON in markdown code fences like:
-        ```json
-        {"key": "value"}
-        ```
-    This function handles that gracefully.
+    Handles two common LLM output patterns:
+    1. <think>...</think> reasoning blocks emitted by qwen3, deepseek-r1,
+       and other chain-of-thought models before the actual JSON response.
+    2. Markdown code fences (```json ... ```) that models sometimes add
+       around JSON output.
 
     Raises
     ------
@@ -642,7 +681,14 @@ def _extract_json(raw: str) -> dict:
     ValueError
         If the parsed result is not a dict.
     """
+    import re
+
     text = raw.strip()
+
+    # Strip <think>...</think> blocks (qwen3, deepseek-r1, etc.)
+    # These models emit a reasoning trace before the JSON answer.
+    # The block can span multiple lines, so re.DOTALL is required.
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
     # Strip markdown code fences if present
     if text.startswith("```"):

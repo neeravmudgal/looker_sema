@@ -46,17 +46,25 @@ $user_query
 1. ONLY use field names from the Available Fields list above. Copy them EXACTLY
    as shown (view_name.field_name format). Never invent or guess field names.
 
-2. Looker time filter syntax:
+2. In Looker, measures ARE fields. If the user asks for "average age", use the
+   pre-defined measure field (e.g. "users.average_age"), NOT the raw dimension
+   with a separate aggregation. Everything goes in the "fields" array.
+   NEVER add a "measures" key — it does not exist in Looker's query format.
+
+3. Looker time filter syntax:
    "last quarter" → "last 1 quarter", "this month" → "this month",
    "30 days" → "30 days", "this year" → "this year"
    Use the pre-resolved value from Time Filter Value if provided.
 
-3. Measure filters go in "having_filters", not "filters".
+4. Measure filters go in "having_filters", not "filters".
 
-4. Include an "explanation" key with a 2-3 sentence plain English explanation.
+5. Include an "explanation" key with a 2-3 sentence plain English explanation.
    Write for a business user — no technical jargon.
 
-5. Default limit: 500. For "top N" queries, set limit to N.
+6. Default limit: 500. For "top N" queries, set limit to N.
    For single aggregation (no dimensions), set limit to 1.
 
-6. Sort by the primary measure descending by default. For trends, sort by date ascending.
+7. Sort by the primary measure descending by default. For trends, sort by date ascending.
+
+8. The ONLY valid keys in the output JSON are: explore, model, fields, filters,
+   having_filters, sorts, limit, explanation. Do NOT add any other keys.

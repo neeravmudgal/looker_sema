@@ -19,6 +19,7 @@ Never propagate exceptions to Streamlit — return a friendly error TurnResponse
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import traceback
@@ -86,6 +87,7 @@ class TurnResponse:
     error_detail: Optional[str] = None
     stages: List[StageInfo] = dataclass_field(default_factory=list)
     total_duration_ms: float = 0.0
+    prompt_log: List[dict] = dataclass_field(default_factory=list)
 
 
 # Type alias for the status callback the UI passes in
@@ -141,6 +143,9 @@ class TurnHandler:
         """
         turn_start = time.time()
 
+        # Clear prompt log so we capture only this turn's LLM calls
+        self._llm.clear_prompt_log()
+
         # Record the user's message
         session.add_turn(ConversationTurn(
             role="user",
@@ -179,6 +184,7 @@ class TurnHandler:
             ))
 
             response.token_count = self._llm.get_token_summary()
+            response.prompt_log = self._llm.get_prompt_log()
             response.total_duration_ms = (time.time() - turn_start) * 1000
 
             return response
@@ -215,11 +221,24 @@ class TurnHandler:
         Process a brand new query (not a clarification response).
 
         Each stage is timed and reported via the notify callback.
+        The notify callback receives structured dicts with stage info
+        so the UI can show real-time elapsed time and data.
         """
         stages: List[StageInfo] = []
 
+        def _stage_notify(stage_num: int, total: int, name: str, status: str = "running", **data):
+            """Send structured stage update to the UI callback."""
+            notify(json.dumps({
+                "stage_num": stage_num,
+                "total_stages": total,
+                "name": name,
+                "status": status,
+                "timestamp": time.time(),
+                **data,
+            }))
+
         # ── Stage 1: Extract intent ───────────────────────────────
-        notify("Stage 1/4 — Extracting intent (LLM call)...")
+        _stage_notify(1, 4, "Intent Extraction", status="running")
         t0 = time.time()
 
         explore_names = self._cache.all_explore_names()
@@ -227,45 +246,72 @@ class TurnHandler:
         intent = self._intent_extractor.extract(user_message, explore_names, available_tags)
 
         stage1_ms = (time.time() - t0) * 1000
+        intent_detail = (
+            f"Metrics: {intent.get('metrics', [])}, "
+            f"Dims: {intent.get('dimensions', [])}, "
+            f"Type: {intent.get('intent_type', '?')}, "
+            f"Attribution: {intent.get('attribution_hint', 'none')}"
+        )
         stages.append(StageInfo(
             name="Intent Extraction",
             status="done",
             duration_ms=stage1_ms,
-            detail=f"Metrics: {intent.get('metrics', [])}, Dims: {intent.get('dimensions', [])}, "
-                   f"Attribution: {intent.get('attribution_hint', 'none')}",
+            detail=intent_detail,
         ))
+        _stage_notify(1, 4, "Intent Extraction", status="done",
+                      duration_ms=stage1_ms, detail=intent_detail,
+                      data={"intent": intent})
         logger.info("Intent extracted in %.0fms: %s", stage1_ms, intent)
 
         # ── Stage 2: Retrieval (embed + ANN + graph) ─────────────
-        notify("Stage 2/4 — Searching knowledge graph (embed + ANN + scoring)...")
+        _stage_notify(2, 4, "Retrieval", status="running")
         t0 = time.time()
 
         result = self._retriever.retrieve(intent, user_message)
 
         stage2_ms = (time.time() - t0) * 1000
         field_count = len(result.selected_fields)
+        top_fields = [f"{f.view_name}.{f.name}" for f in result.selected_fields[:10]]
+        explore_scores_summary = {k: round(v, 3) for k, v in sorted(
+            result._explore_scores.items(), key=lambda x: x[1], reverse=True
+        )}
+        retrieval_detail = (
+            f"Found {field_count} fields, "
+            f"Explore: {result.explore_name or 'none'}, "
+            f"Confidence: {result.confidence_score:.2f}"
+        )
         stages.append(StageInfo(
             name="Retrieval (Embed → ANN → Graph → Score)",
             status="done",
             duration_ms=stage2_ms,
-            detail=f"Found {field_count} fields, "
-                   f"Explore: {result.explore_name or 'none'}, "
-                   f"Confidence: {result.confidence_score:.2f}",
+            detail=retrieval_detail,
         ))
+        _stage_notify(2, 4, "Retrieval", status="done",
+                      duration_ms=stage2_ms, detail=retrieval_detail,
+                      data={
+                          "explore_scores": explore_scores_summary,
+                          "top_fields": top_fields,
+                          "all_candidates_count": len(result._all_candidates),
+                      })
 
         # ── Stage 3: Ambiguity check ─────────────────────────────
-        notify("Stage 3/4 — Checking for ambiguities...")
+        _stage_notify(3, 4, "Ambiguity Detection", status="running")
         t0 = time.time()
 
         # Ambiguity is already checked inside retriever, just record timing
         stage3_ms = (time.time() - t0) * 1000
         if result.needs_clarification:
+            amb_detail = f"Ambiguity found: {result.ambiguity_type}"
             stages.append(StageInfo(
                 name="Ambiguity Detection",
                 status="done",
                 duration_ms=stage3_ms,
-                detail=f"Ambiguity found: {result.ambiguity_type}",
+                detail=amb_detail,
             ))
+            _stage_notify(3, 4, "Ambiguity Detection", status="done",
+                          duration_ms=stage3_ms, detail=amb_detail,
+                          data={"type": result.ambiguity_type,
+                                "options": result.clarification_options})
             # Return clarification — don't proceed to query gen
             session.set_pending(result, intent, user_message)
             return TurnResponse(
@@ -276,12 +322,15 @@ class TurnHandler:
                 stages=stages,
             )
 
+        amb_detail = "No ambiguity detected" if field_count > 0 else "No fields found"
         stages.append(StageInfo(
             name="Ambiguity Detection",
             status="done",
             duration_ms=stage3_ms,
-            detail="No ambiguity detected" if field_count > 0 else "No fields found",
+            detail=amb_detail,
         ))
+        _stage_notify(3, 4, "Ambiguity Detection", status="done",
+                      duration_ms=stage3_ms, detail=amb_detail)
 
         # No match at all
         if not result.selected_fields:
@@ -291,7 +340,7 @@ class TurnHandler:
             )
 
         # ── Stage 4: Build query + explanation ────────────────────
-        notify("Stage 4/4 — Building query + generating explanation...")
+        _stage_notify(4, 4, "Query Generation", status="running")
         t0 = time.time()
 
         context = self._context_assembler.assemble(result, intent)
@@ -307,14 +356,20 @@ class TurnHandler:
 
         explanation = query.pop("explanation", "") or self._build_fallback_explanation(result)
 
+        query_detail = (
+            f"Fields: {len(query.get('fields', []))}, "
+            f"Filters: {len(query.get('filters', {}))}, "
+            f"Explore: {query.get('explore', '?')}"
+        )
         stages.append(StageInfo(
-            name="Query Build + Explanation",
+            name="Query Generation",
             status="done",
             duration_ms=stage4_ms,
-            detail=f"Fields: {len(query.get('fields', []))}, "
-                   f"Filters: {len(query.get('filters', {}))}, "
-                   f"Explore: {query.get('explore', '?')}",
+            detail=query_detail,
         ))
+        _stage_notify(4, 4, "Query Generation", status="done",
+                      duration_ms=stage4_ms, detail=query_detail,
+                      data={"query_fields": query.get("fields", [])})
 
         final_query = query
         fields_used = final_query.get("fields", [])
@@ -340,14 +395,21 @@ class TurnHandler:
         """
         Process a user's response to a clarification question.
 
-        Key insight: for attribution ambiguity, the user's choice tells us
-        which specific field to use. We modify the intent with the hint,
-        then re-run retrieval so the scoring picks the right explore that
-        contains that field. We do NOT blindly re-run — the attribution_hint
-        guides the retriever to prefer fields matching the chosen model.
+        ROUTING BY AMBIGUITY TYPE:
+        - attribution: Re-run retrieval with the attribution_hint set in intent,
+          so scoring picks the right field/explore.
+        - explore_conflict: The user picked an explore directly. Do NOT re-run
+          retrieval (it would just pick the same top-scoring explore again).
+          Instead, re-populate the result from the chosen explore and proceed.
+        - field_collision: The user picked a view. Use resolved result directly.
         """
         stages: List[StageInfo] = []
         t0 = time.time()
+
+        # Save the ambiguity type before resolve_pending clears it
+        pending_ambiguity_type = None
+        if session.pending_retrieval:
+            pending_ambiguity_type = session.pending_retrieval.ambiguity_type
 
         try:
             result, intent, original_query = session.resolve_pending(user_message)
@@ -360,13 +422,49 @@ class TurnHandler:
             name="Clarification Resolved",
             status="done",
             duration_ms=(time.time() - t0) * 1000,
-            detail=f"Choice: {user_message[:50]}, Attribution: {intent.get('attribution_hint', 'none')}",
+            detail=f"Choice: {user_message[:50]}, Type: {pending_ambiguity_type}, "
+                   f"Explore: {result.explore_name}",
         ))
 
-        # Re-run retrieval with the attribution hint so it picks the correct field
-        notify("Re-running retrieval with your choice...")
-        t0 = time.time()
-        result = self._retriever.retrieve(intent, original_query)
+        if pending_ambiguity_type == "attribution":
+            # Re-run retrieval — the attribution_hint guides field selection
+            notify("Re-running retrieval with your choice...")
+            t0 = time.time()
+            result = self._retriever.retrieve(intent, original_query)
+        elif pending_ambiguity_type == "explore_conflict":
+            # User chose an explore — re-populate fields from that explore
+            # but do NOT re-run full retrieval (it would ignore the choice)
+            notify("Loading fields from your chosen explore...")
+            t0 = time.time()
+            chosen_explore = result.explore_name
+            # Re-populate selected_fields from the chosen explore's candidates
+            explore_candidates = [
+                c for c in result._all_candidates
+                if c.get("explore_name") == chosen_explore
+            ]
+            if explore_candidates:
+                # Rebuild selected fields from the cache for this explore
+                ctx = self._retriever._cache.get_explore(chosen_explore)
+                if ctx:
+                    from src.parser.models import LookMLField
+                    result.selected_fields = []
+                    seen = set()
+                    for c in explore_candidates:
+                        fqn = f"{c['view_name']}.{c['field_name']}"
+                        if fqn not in seen:
+                            seen.add(fqn)
+                            # Find the field in cache
+                            for f in ctx.get("fields", []):
+                                if f.name == c["field_name"] and f.view_name == c["view_name"]:
+                                    result.selected_fields.append(f)
+                                    break
+                    result.model_name = ctx.get("model_name", "")
+                    result.joins_needed = ctx.get("joins", [])
+        else:
+            # field_collision or other — re-run retrieval with resolved result
+            notify("Re-running retrieval with your choice...")
+            t0 = time.time()
+            result = self._retriever.retrieve(intent, original_query)
         stages.append(StageInfo(
             name="Re-retrieval with hint",
             status="done",

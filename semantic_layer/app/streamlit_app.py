@@ -114,8 +114,8 @@ def initialize_system() -> dict:
         }
 
         try:
-            embed_stats = embedder.embed_all(all_fields, explore_contexts)
-            progress.progress(90, text=f"Embedded {embed_stats['fields_embedded']} fields")
+            embed_stats = embedder.embed_all(all_fields, explore_contexts, views=views)
+            progress.progress(90, text=f"Embedded {embed_stats['fields_embedded']} fields, {embed_stats.get('views_embedded', 0)} views")
         except Exception as exc:
             logger.warning("Embedding failed (system will work without ANN search): %s", exc)
             embed_stats = {"fields_embedded": 0, "explores_embedded": 0}

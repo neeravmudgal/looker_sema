@@ -230,6 +230,7 @@ view: users {
   }
 
   set: user_facts {
-    fields: [name, email, age, gender, created_date, created_month]
+    fields: [name, email, age, gender, created_date, created_month,
+             count, average_age, count_percent_of_total]
   }
 }

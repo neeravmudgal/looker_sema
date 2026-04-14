@@ -1,18 +1,11 @@
 """
 Chat interface component — renders conversation history and handles input.
-
-Renders each turn as a chat message with appropriate formatting:
-  - Answer: message + stage timing + collapsible query JSON + explanation
-  - Clarification: message + clickable option buttons
-  - No match: message + suggestion chips
-  - Error: message + expandable error detail
-
-Shows real-time pipeline stage progress while processing.
 """
 
 from __future__ import annotations
 
 import json
+import time
 import streamlit as st
 
 
@@ -26,7 +19,6 @@ def render_chat(system: dict, session) -> None:
                 st.markdown(turn.content)
         else:
             with st.chat_message("assistant"):
-                # ── Stage timing (collapsible) ────────────────────
                 if turn.stages:
                     total_str = f"{turn.total_duration_ms:.0f}ms"
                     with st.expander(f"Pipeline stages — {total_str}", expanded=False):
@@ -39,10 +31,8 @@ def render_chat(system: dict, session) -> None:
                             if stage.get("detail"):
                                 st.caption(f"    {stage['detail']}")
 
-                # ── Main message ──────────────────────────────────
                 st.markdown(turn.content)
 
-                # Answer: show query and explanation
                 if turn.turn_type == "answer" and turn.generated_query:
                     with st.expander("Generated Looker Query", expanded=False):
                         display_query = {
@@ -65,7 +55,7 @@ def render_chat(system: dict, session) -> None:
                 if turn.turn_type == "error":
                     st.error("An error occurred processing your question.")
 
-    # ── Clarification buttons (only for the latest turn) ──────────
+    # ── Clarification buttons ────────────────────────────────────
     if session.state == "WAITING_FOR_CLARIFICATION" and session.turns:
         latest = session.turns[-1]
         if latest.role == "assistant" and latest.turn_type == "clarification":
@@ -88,92 +78,70 @@ def _process_message(message: str, system: dict, session) -> None:
         st.error("System not ready. Please wait for initialization.")
         return
 
-    # Show the user message immediately
     with st.chat_message("user"):
         st.markdown(message)
 
-    # Process with real-time stage updates
     with st.chat_message("assistant"):
-        # Use st.status() for a collapsible live-updating progress area
         with st.status("Processing your question...", expanded=True) as status_container:
-            # This placeholder gets updated with each stage notification
             stage_display = st.empty()
-            stage_log = []
+            completed_stages = []
+            current_stage = None
+            pipeline_start = time.time()
 
             def on_status(stage_msg: str):
-                """Callback invoked by TurnHandler at each pipeline stage."""
-                stage_log.append(stage_msg)
-                # Render all stages so far
+                nonlocal current_stage
+                try:
+                    info = json.loads(stage_msg)
+                except (json.JSONDecodeError, TypeError):
+                    info = {"name": stage_msg, "status": "running"}
+
+                if info.get("status") == "running":
+                    current_stage = info
+                elif info.get("status") == "done":
+                    completed_stages.append(info)
+                    current_stage = None
+
+                # Render live progress with elapsed time
                 lines = []
-                for i, msg in enumerate(stage_log):
-                    if i < len(stage_log) - 1:
-                        lines.append(f"  ✅ {msg}")
-                    else:
-                        lines.append(f"  ⏳ {msg}")
+                for s in completed_stages:
+                    ms = s.get("duration_ms", 0)
+                    lines.append(f"✅ **{s.get('name', '?')}** — {ms:.0f}ms")
+                    if s.get("detail"):
+                        lines.append(f"  _{s['detail']}_")
+                if current_stage:
+                    elapsed = (time.time() - current_stage.get("timestamp", pipeline_start)) * 1000
+                    lines.append(f"⏳ **{current_stage.get('name', '?')}** — {elapsed:.0f}ms...")
                 stage_display.markdown("\n\n".join(lines))
 
             response = turn_handler.handle_turn(message, session, status_callback=on_status)
 
-            # Show final stage summary with timings
+            # ── Final render: stages with timing ─────────────────
             if response.stages:
-                timing_lines = []
+                lines = []
                 for stage in response.stages:
-                    if stage.status == "done":
-                        icon = "✅"
-                    elif stage.status == "error":
-                        icon = "❌"
-                    elif stage.status == "skipped":
-                        icon = "⏭️"
-                    else:
-                        icon = "⏳"
-
-                    time_str = f"{stage.duration_ms:.0f}ms"
-                    timing_lines.append(
-                        f"  {icon} **{stage.name}** — {time_str}"
-                    )
+                    icon = {"done": "✅", "error": "❌", "skipped": "⏭️"}.get(stage.status, "⏳")
+                    lines.append(f"{icon} **{stage.name}** — {stage.duration_ms:.0f}ms")
                     if stage.detail:
-                        timing_lines.append(f"     _{stage.detail}_")
+                        lines.append(f"  _{stage.detail}_")
+                lines.append(f"\n**Total: {response.total_duration_ms:.0f}ms**")
+                stage_display.markdown("\n\n".join(lines))
 
-                total_str = f"{response.total_duration_ms:.0f}ms"
-                timing_lines.append(f"\n  **Total: {total_str}**")
-
-                stage_display.markdown("\n\n".join(timing_lines))
-
-            # Update the status container label
+            # Update status label
             if response.turn_type == "answer":
-                status_container.update(
-                    label=f"Done in {response.total_duration_ms:.0f}ms",
-                    state="complete",
-                    expanded=False,
-                )
+                status_container.update(label=f"Done in {response.total_duration_ms:.0f}ms", state="complete", expanded=False)
             elif response.turn_type == "clarification":
-                status_container.update(
-                    label="Needs clarification",
-                    state="complete",
-                    expanded=False,
-                )
+                status_container.update(label="Needs clarification", state="complete", expanded=False)
             elif response.turn_type == "no_match":
-                status_container.update(
-                    label="No confident match found",
-                    state="complete",
-                    expanded=False,
-                )
+                status_container.update(label="No confident match found", state="complete", expanded=False)
             else:
-                status_container.update(
-                    label="Error occurred",
-                    state="error",
-                    expanded=True,
-                )
+                status_container.update(label="Error occurred", state="error", expanded=True)
 
-        # ── Render the actual response below the status ───────────
+        # ── Response content ─────────────────────────────────────
         st.markdown(response.message)
 
         if response.turn_type == "answer" and response.query:
             with st.expander("Generated Looker Query", expanded=True):
-                display_query = {
-                    k: v for k, v in response.query.items()
-                    if not k.startswith("_")
-                }
+                display_query = {k: v for k, v in response.query.items() if not k.startswith("_")}
                 st.code(json.dumps(display_query, indent=2), language="json")
 
             if response.confidence is not None:
@@ -191,4 +159,60 @@ def _process_message(message: str, system: dict, session) -> None:
             with st.expander("Technical detail"):
                 st.code(response.error_detail, language="text")
 
+        # ── Debug Panel: everything that happened ────────────────
+        _render_debug_panel(response, completed_stages)
+
     st.rerun()
+
+
+def _render_debug_panel(response, completed_stages: list):
+    """
+    Render a full debug panel showing everything that happened:
+    - Each pipeline stage with its data (intent, candidates, scores)
+    - Every LLM call with full system prompt, user prompt, raw response
+    """
+    with st.expander("Debug: Full Pipeline Details", expanded=False):
+
+        # ── Stage-by-stage data ──────────────────────────────────
+        st.markdown("## Pipeline Stages")
+
+        for i, stage_data in enumerate(completed_stages):
+            name = stage_data.get("name", f"Stage {i+1}")
+            ms = stage_data.get("duration_ms", 0)
+            detail = stage_data.get("detail", "")
+            data = stage_data.get("data")
+
+            st.markdown(f"### {i+1}. {name} ({ms:.0f}ms)")
+            if detail:
+                st.markdown(f"_{detail}_")
+
+            if data:
+                st.json(data)
+
+            st.divider()
+
+        # ── LLM Calls ────────────────────────────────────────────
+        if response.prompt_log:
+            st.markdown("## LLM Calls")
+
+            for entry in response.prompt_log:
+                call_num = entry["call_number"]
+                mode = "JSON" if entry["json_mode"] else "Text"
+
+                st.markdown(f"### LLM Call {call_num} ({mode} mode)")
+
+                # System prompt
+                with st.expander(f"System Prompt (Call {call_num})", expanded=False):
+                    st.code(entry["system_prompt"], language="text")
+
+                # User prompt (the big one - full context sent to the LLM)
+                with st.expander(f"User Prompt (Call {call_num})", expanded=False):
+                    st.code(entry["user_prompt"], language="text")
+
+                # Raw response
+                with st.expander(f"Raw LLM Response (Call {call_num})", expanded=True):
+                    st.code(entry["raw_response"], language="json")
+
+                st.divider()
+        else:
+            st.markdown("_No LLM calls recorded for this turn._")

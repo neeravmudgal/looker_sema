@@ -10,9 +10,9 @@ CALLED BY: turn_handler.py
 CALLS: embedder (vector search), cache (field-to-explore mapping),
        ambiguity_detector (check for conflicts)
 
-THE 5-STEP PIPELINE:
+THE PIPELINE:
   1. Embed the structured intent string (not raw query — better matching)
-  2. ANN search Neo4j vector index for candidate fields + explores
+  2. ANN search Neo4j vector index for candidate fields (deduplicated)
   3. Use the in-memory cache to map each field to its explore(s)
   4. Score each explore by coverage, penalize by join count
   5. Run ambiguity detection before returning
@@ -21,6 +21,7 @@ THE 5-STEP PIPELINE:
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field as dataclass_field
 from typing import Dict, List, Optional
 
@@ -56,7 +57,6 @@ class RetrievalResult:
     warnings: List[str] = dataclass_field(default_factory=list)
     alternatives: List[dict] = dataclass_field(default_factory=list)
     ambiguity_type: Optional[str] = None
-    # Store raw candidates so ambiguity resolution can pick from them
     _all_candidates: List[dict] = dataclass_field(default_factory=list)
     _explore_scores: Dict[str, float] = dataclass_field(default_factory=dict)
 
@@ -82,22 +82,10 @@ class Retriever:
         self._ambiguity_detector = AmbiguityDetector(cache)
 
     def retrieve(self, intent: dict, user_query: str) -> RetrievalResult:
-        """
-        Run the full 5-step retrieval pipeline.
-
-        Args:
-            intent: Structured intent from IntentExtractor.
-            user_query: Original user query (for ambiguity messages).
-
-        Returns:
-            RetrievalResult with selected explore, fields, and confidence.
-        """
+        """Run the full retrieval pipeline."""
         result = RetrievalResult()
 
         # ── Step 1: Build and embed the intent string ─────────────
-        # We embed the structured intent rather than the raw query because
-        # "revenue by country" matches field embeddings better than
-        # "Show me total revenue broken down by user country last quarter"
         intent_text = self._build_intent_string(intent)
         logger.info("Embedding intent: '%s'", intent_text)
 
@@ -108,17 +96,21 @@ class Retriever:
             result.warnings.append(f"Embedding failed: {exc}")
             return result
 
-        # ── Step 2: ANN search for candidate fields ───────────────
-        candidates = self._ann_search_fields(query_embedding)
+        # ── Step 2: Hybrid search — vector ANN + fulltext keyword ─
+        # Vector finds semantically similar fields.
+        # Fulltext finds exact keyword matches in name/label/description.
+        # Merge both, deduplicate, keep highest score per field.
+        vector_candidates = self._ann_search_fields(query_embedding)
+        fulltext_candidates = self._fulltext_search_fields(intent, user_query)
+        candidates = self._merge_candidates(vector_candidates, fulltext_candidates)
+
         if not candidates:
-            logger.info("No field candidates found via ANN search")
+            logger.info("No field candidates found")
             return result
 
         result._all_candidates = candidates
 
         # ── Step 3: Map each candidate to its explore(s) via cache ─
-        # Group candidates by explore, counting how many requested
-        # fields each explore can serve
         explore_field_map = self._group_by_explore(candidates, intent)
 
         if not explore_field_map:
@@ -127,24 +119,24 @@ class Retriever:
 
         # ── Step 4: Score each explore ────────────────────────────
         explore_scores = self._score_explores(explore_field_map, intent)
+
+        # Boost if user explicitly named an explore ("in events", "from sessions")
+        explore_scores = self._apply_explicit_explore_boost(explore_scores, user_query)
+
         result._explore_scores = explore_scores
 
         if not explore_scores:
             return result
 
-        # Sort explores by score
         sorted_explores = sorted(explore_scores.items(), key=lambda x: x[1], reverse=True)
         best_explore_name, best_score = sorted_explores[0]
 
-        # Check confidence threshold
         if best_score < settings.confidence_threshold:
             result.confidence_score = best_score
-            # Return top suggestions even though confidence is low
             result.warnings.append(
                 f"Low confidence ({best_score:.2f}). "
                 f"Closest matches: {', '.join(e[0] for e in sorted_explores[:3])}"
             )
-            # Still populate the result so caller can decide
             self._populate_result(result, best_explore_name, explore_field_map, best_score)
             return result
 
@@ -161,16 +153,12 @@ class Retriever:
             result.ambiguity_type = ambiguity.ambiguity_type
             result.clarification_question = ambiguity.question
             result.clarification_options = ambiguity.options
-            # Store the conflicting field candidates so resolution can use them
             result._ambiguity_field_candidates = ambiguity.field_candidates
             if not ambiguity.is_blocking:
-                # Non-blocking: add as warning and still populate result
                 result.warnings.append(ambiguity.question)
 
-        # Populate the result with the best explore's fields
         self._populate_result(result, best_explore_name, explore_field_map, best_score)
 
-        # Track alternatives if top-2 are close
         if len(sorted_explores) >= 2:
             second_name, second_score = sorted_explores[1]
             if best_score - second_score < settings.ambiguity_threshold:
@@ -179,27 +167,17 @@ class Retriever:
                     "score": second_score,
                 })
 
-        # ── Fanout warning ────────────────────────────────────────
         self._check_fanout_warnings(result)
-
-        # ── PDT warning ───────────────────────────────────────────
         self._check_pdt_warnings(result)
 
         return result
 
     def _build_intent_string(self, intent: dict) -> str:
-        """
-        Build a search-optimized string from structured intent.
-
-        This string bridges the gap between natural language queries and the
-        verbose field embedding text format. We include contextual keywords
-        that help the embedding model match against field descriptions.
-        """
+        """Build a search-optimized string from structured intent."""
         parts = []
 
         metrics = intent.get("metrics", [])
         if metrics:
-            # Include both the metric name and "measure" keyword to match field embeddings
             metric_text = " ".join(metrics)
             parts.append(f"measure {metric_text}")
 
@@ -235,20 +213,22 @@ class Retriever:
 
     def _ann_search_fields(self, embedding: List[float]) -> List[dict]:
         """
-        Query the Neo4j vector index for candidate fields.
+        Query the Neo4j vector index for candidate fields, deduplicated.
 
-        Returns a list of dicts with field info + similarity score.
+        Fetches extra results since the same field exists per explore
+        with identical embeddings. Deduplicates by (name, view_name).
         """
-        candidates = []
+        raw_k = settings.top_k_fields * 3
+        raw_candidates = []
         try:
             with self._driver.session() as session:
                 result = session.run(
                     Q.ANN_SEARCH_FIELDS,
-                    k=settings.top_k_fields,
+                    k=raw_k,
                     embedding=embedding,
                 )
                 for record in result:
-                    candidates.append({
+                    raw_candidates.append({
                         "field_name": record["field_name"],
                         "view_name": record["view_name"],
                         "explore_name": record["explore_name"],
@@ -264,32 +244,121 @@ class Retriever:
         except Exception as exc:
             logger.error("ANN search failed: %s", exc)
 
-        logger.info("ANN search returned %d candidates", len(candidates))
+        # Deduplicate: keep the highest-scoring copy of each (name, view_name)
+        seen = {}
+        for c in raw_candidates:
+            key = (c["field_name"], c["view_name"])
+            if key not in seen or c["score"] > seen[key]["score"]:
+                seen[key] = c
+
+        candidates = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
+        candidates = candidates[:settings.top_k_fields]
+
+        logger.info(
+            "ANN search: %d raw → %d unique → %d top-k candidates",
+            len(raw_candidates), len(seen), len(candidates),
+        )
         return candidates
+
+    def _fulltext_search_fields(self, intent: dict, user_query: str) -> List[dict]:
+        """
+        Search the fulltext index for exact keyword matches.
+
+        Complements vector search: when user says "revenue", fulltext
+        finds fields literally named "revenue" or with "revenue" in
+        their label/description. Vector search might rank "net_profit"
+        higher if its description mentions "revenue".
+        """
+        # Build search terms from intent metrics + dimensions
+        terms = []
+        for m in intent.get("metrics", []):
+            terms.extend(m.replace("_", " ").split())
+        for d in intent.get("dimensions", []):
+            terms.extend(d.replace("_", " ").split())
+
+        if not terms:
+            return []
+
+        # Lucene query: OR across all terms
+        query = " OR ".join(terms)
+
+        candidates = []
+        try:
+            with self._driver.session() as session:
+                result = session.run(
+                    Q.FULLTEXT_SEARCH_FIELDS,
+                    query=query,
+                    k=settings.top_k_fields,
+                )
+                for record in result:
+                    # Normalize fulltext score to 0-1 range (Lucene scores can be >1)
+                    raw_score = record["score"]
+                    normalized_score = min(raw_score / 10.0, 1.0)
+                    candidates.append({
+                        "field_name": record["field_name"],
+                        "view_name": record["view_name"],
+                        "explore_name": record["explore_name"],
+                        "field_type": record["field_type"],
+                        "data_type": record.get("data_type", ""),
+                        "label": record.get("label", ""),
+                        "description": record.get("description", ""),
+                        "tags": record.get("tags", []) or [],
+                        "sql": record.get("sql", ""),
+                        "model_name": record.get("model_name", ""),
+                        "score": normalized_score,
+                    })
+        except Exception as exc:
+            # Fulltext index may not exist yet — not fatal
+            logger.warning("Fulltext search failed (may not be indexed yet): %s", exc)
+
+        logger.info("Fulltext search for '%s': %d candidates", query, len(candidates))
+        return candidates
+
+    def _merge_candidates(
+        self,
+        vector_candidates: List[dict],
+        fulltext_candidates: List[dict],
+    ) -> List[dict]:
+        """
+        Merge vector and fulltext results, keeping the best score per field.
+
+        If a field appears in both, take the higher score.
+        Deduplicate by (field_name, view_name) across both sources.
+        """
+        seen = {}
+        for c in vector_candidates:
+            key = (c["field_name"], c["view_name"])
+            if key not in seen or c["score"] > seen[key]["score"]:
+                seen[key] = c
+
+        for c in fulltext_candidates:
+            key = (c["field_name"], c["view_name"])
+            if key not in seen or c["score"] > seen[key]["score"]:
+                seen[key] = c
+
+        merged = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
+        merged = merged[:settings.top_k_fields]
+
+        logger.info(
+            "Merged candidates: %d vector + %d fulltext → %d unique → %d top-k",
+            len(vector_candidates), len(fulltext_candidates), len(seen), len(merged),
+        )
+        return merged
 
     def _group_by_explore(
         self,
         candidates: List[dict],
         intent: dict,
     ) -> Dict[str, List[dict]]:
-        """
-        Group candidate fields by explore, using the cache's reverse index.
-
-        For each candidate field, we look up which explores contain it.
-        Result: explore_name → [candidate_dicts]
-
-        IMPORTANT: Skips hidden explores — they should never appear in results.
-        """
+        """Group candidate fields by explore, using the cache's reverse index."""
         explore_field_map: Dict[str, List[dict]] = {}
 
-        # Build set of hidden explores to skip
         hidden_explores = set()
         for name in self._cache.all_explore_names():
             ctx = self._cache.get_explore(name)
             if ctx and ctx.get("explore", {}).get("is_hidden", False):
                 hidden_explores.add(name)
 
-        # Also get all valid (non-hidden) explore names
         valid_explores = set(self._cache.all_explore_names()) - hidden_explores
 
         for candidate in candidates:
@@ -297,16 +366,11 @@ class Retriever:
             explores = self._cache.get_explores_for_field(field_id)
 
             for explore_name in explores:
-                # Skip hidden explores
-                if explore_name in hidden_explores:
-                    continue
-                # Skip explores not in our valid set
-                if explore_name not in valid_explores:
+                if explore_name in hidden_explores or explore_name not in valid_explores:
                     continue
 
                 if explore_name not in explore_field_map:
                     explore_field_map[explore_name] = []
-                # Avoid duplicates within same explore
                 existing = {
                     f"{c['view_name']}.{c['field_name']}"
                     for c in explore_field_map[explore_name]
@@ -321,23 +385,7 @@ class Retriever:
         explore_field_map: Dict[str, List[dict]],
         intent: dict,
     ) -> Dict[str, float]:
-        """
-        Score each explore by how well it covers the requested fields.
-
-        Scoring formula:
-          best_score  = highest similarity score among matched fields
-          avg_score   = average similarity of top-N fields (N = requested count)
-            (Only average the most relevant fields, not ANN noise)
-          blended     = 0.6 * best_score + 0.4 * avg_top_score
-          coverage_bonus = small bonus when the explore covers multiple requested slots
-          join_penalty = 0.005 per join (very light — joins are normal in LookML)
-          final       = blended + coverage_bonus - join_penalty
-
-        Key change: coverage is now an additive BONUS (0-0.1), not a multiplicative
-        factor. The old formula (blended * coverage) halved scores when only 1 of 2
-        requested fields was found, which is too aggressive — finding 1 field well
-        is a strong signal even if the second isn't in the ANN top-k.
-        """
+        """Score each explore by how well it covers the requested fields."""
         scores: Dict[str, float] = {}
 
         requested_count = max(
@@ -352,20 +400,14 @@ class Retriever:
             field_scores = sorted([f["score"] for f in matched_fields], reverse=True)
             best_score = field_scores[0]
 
-            # Average only the top-N scores where N = requested field count
-            # This avoids diluting the score with low-relevance ANN tail results
             top_n = min(requested_count, len(field_scores))
             avg_top_score = sum(field_scores[:top_n]) / top_n
 
-            # Blend: weight the best match and top-N average
             blended = 0.6 * best_score + 0.4 * avg_top_score
 
-            # Coverage bonus: small additive reward for covering more requested slots
-            # Capped at 0.1 so it nudges but doesn't dominate
             coverage_ratio = min(len(matched_fields) / requested_count, 1.0)
             coverage_bonus = 0.1 * coverage_ratio
 
-            # Very light join penalty — joins are normal, not a red flag
             ctx = self._cache.get_explore(explore_name)
             join_count = len(ctx.get("joins", [])) if ctx else 0
             join_penalty = 0.005 * join_count
@@ -377,6 +419,34 @@ class Retriever:
                 "Explore '%s': best=%.3f avg_top=%.3f coverage=%.2f joins=%d → score=%.3f",
                 explore_name, best_score, avg_top_score, coverage_ratio, join_count, final_score,
             )
+
+        return scores
+
+    def _apply_explicit_explore_boost(
+        self,
+        scores: Dict[str, float],
+        user_query: str,
+    ) -> Dict[str, float]:
+        """Boost an explore's score if the user explicitly named it in the query."""
+        query_lower = user_query.lower()
+
+        for explore_name in scores:
+            name_lower = explore_name.lower()
+            patterns = [
+                rf"\bin\s+{re.escape(name_lower)}\b",
+                rf"\bfrom\s+{re.escape(name_lower)}\b",
+                rf"\busing\s+{re.escape(name_lower)}\b",
+                rf"\b{re.escape(name_lower)}\s+explore\b",
+                rf"\b{re.escape(name_lower)}\s+data\b",
+            ]
+            if any(re.search(p, query_lower) for p in patterns):
+                old_score = scores[explore_name]
+                scores[explore_name] = min(old_score + 0.2, 1.0)
+                logger.info(
+                    "Boosted explore '%s' (%.3f → %.3f) — user explicitly named it",
+                    explore_name, old_score, scores[explore_name],
+                )
+                break
 
         return scores
 
@@ -397,7 +467,6 @@ class Retriever:
         result.confidence_score = score
         result.joins_needed = ctx.get("joins", [])
 
-        # Convert matched candidates to LookMLField objects
         matched = explore_field_map.get(explore_name, [])
         for m in matched:
             field = LookMLField(
@@ -415,22 +484,11 @@ class Retriever:
             result.selected_fields.append(field)
 
     def _check_fanout_warnings(self, result: RetrievalResult) -> None:
-        """
-        Warn if a SUM/COUNT measure is used alongside a one-to-many join.
-
-        The risk: when a one_to_many join is present and any field from that
-        joined view is selected, rows from OTHER views get duplicated.
-        So a measure from the base view or another many_to_one view will
-        be double-counted.
-
-        We also warn about measures FROM the one_to_many view itself,
-        since they are aggregated across the fanout.
-        """
+        """Warn if measures are used alongside a one-to-many join."""
         measure_fields = [f for f in result.selected_fields if f.field_type == "measure"]
         if not measure_fields:
             return
 
-        # Identify one_to_many joined views
         otm_views = set()
         for join in result.joins_needed:
             if join.get("relationship") == "one_to_many":
@@ -439,20 +497,14 @@ class Retriever:
         if not otm_views:
             return
 
-        # Check if any field from a one_to_many view is selected (dimension or measure)
         selected_views = {f.view_name for f in result.selected_fields}
         active_otm = otm_views & selected_views
 
         if not active_otm:
-            # No fields selected from the one_to_many view, so Looker won't include
-            # that join — no fanout risk
             return
 
+        otm_view_str = ", ".join(sorted(active_otm))
         for mf in measure_fields:
-            # Warn about measures that could be inflated by the fanout
-            # This includes measures from the one_to_many view AND measures
-            # from other views that will see duplicated rows
-            otm_view_str = ", ".join(sorted(active_otm))
             if mf.view_name in active_otm:
                 result.warnings.append(
                     f"Warning: '{mf.label}' is aggregated across a one-to-many join "
@@ -461,7 +513,7 @@ class Retriever:
             else:
                 result.warnings.append(
                     f"Warning: '{mf.label}' may be inflated because fields from "
-                    f"'{otm_view_str}' (one-to-many) are also selected, causing row duplication."
+                    f"'{otm_view_str}' (one-to-many) are also selected."
                 )
 
     def _check_pdt_warnings(self, result: RetrievalResult) -> None:
@@ -481,4 +533,4 @@ class Retriever:
                     f"Note: '{field.view_name}' is a derived table that refreshes "
                     f"periodically. Data may not reflect the most recent changes."
                 )
-                break  # One warning per PDT view is enough
+                break
