@@ -62,7 +62,8 @@ class Embedder:
 
         if self._provider == "openai":
             import openai
-            self._client = openai.OpenAI(api_key=settings.openai_api_key)
+            key = settings.openai_api_key or None
+            self._client = openai.OpenAI(api_key=key)
         elif self._provider == "google":
             import google.genai as genai
             self._client = genai.Client(api_key=settings.google_api_key)

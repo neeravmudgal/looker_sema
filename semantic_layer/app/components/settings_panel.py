@@ -49,7 +49,13 @@ def render_settings_panel(system: dict, session) -> None:
         llm = system["llm"]
         if llm.provider != provider or llm.model != model:
             from src.llm.provider import LLMProvider
-            system["llm"] = LLMProvider(provider=provider, model=model)
+            from src.config import settings as _settings
+            _api_key = {
+                "openai": _settings.openai_api_key,
+                "anthropic": _settings.anthropic_api_key,
+                "google": _settings.google_api_key,
+            }.get(provider)
+            system["llm"] = LLMProvider(provider=provider, model=model, api_key=_api_key or None)
             # Re-create turn handler with new LLM
             from src.conversation.turn_handler import TurnHandler
             system["turn_handler"] = TurnHandler(

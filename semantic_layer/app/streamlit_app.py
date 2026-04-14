@@ -125,9 +125,18 @@ def initialize_system() -> dict:
         from src.llm.provider import LLMProvider
         from src.conversation.turn_handler import TurnHandler
 
+        # Pass the API key from settings — pydantic loads it from .env
+        # but the OpenAI SDK needs it explicitly since .env isn't in os.environ
+        api_key = {
+            "openai": settings.openai_api_key,
+            "anthropic": settings.anthropic_api_key,
+            "google": settings.google_api_key,
+        }.get(settings.default_llm_provider)
+
         llm = LLMProvider(
             provider=settings.default_llm_provider,
             model=settings.default_llm_model,
+            api_key=api_key or None,
         )
         turn_handler = TurnHandler(driver, cache, embedder, llm)
 

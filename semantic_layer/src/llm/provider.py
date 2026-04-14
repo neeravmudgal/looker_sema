@@ -139,6 +139,15 @@ class LLMProvider:
         want to fail fast if the SDK is not installed or the key is invalid,
         rather than failing on the first .complete() call minutes later.
         """
+        # Resolve API key: explicit param → settings → env var (SDK default)
+        from src.config import settings
+        if not api_key:
+            api_key = {
+                "openai": settings.openai_api_key,
+                "anthropic": settings.anthropic_api_key,
+                "google": settings.google_api_key,
+            }.get(self.provider, "") or None
+
         if self.provider == "openai":
             try:
                 from openai import OpenAI

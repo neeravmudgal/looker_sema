@@ -230,7 +230,8 @@ view: users {
   }
 
   set: user_facts {
-    fields: [name, email, age, gender, created_date, created_month,
+    fields: [name, email, age, age_tier, gender, created_date, created_month,
+             city, state, zip, country, location, approx_location, traffic_source,
              count, average_age, count_percent_of_total]
   }
 }
