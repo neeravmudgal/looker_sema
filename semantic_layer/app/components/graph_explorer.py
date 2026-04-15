@@ -15,7 +15,23 @@ from src.graph.cache import ExploreContextCache
 
 
 def render_graph_explorer(cache: ExploreContextCache) -> None:
-    """Render the graph explorer panel in the sidebar."""
+    """
+    Render the graph explorer panel in the sidebar.
+
+    WHY: Users need a way to browse what data is available before asking
+    questions. This component lets them drill into explores, filter by
+    field type, and inspect individual fields — building confidence in
+    what the semantic layer knows about.
+
+    Args:
+        cache: The in-memory ExploreContextCache holding all parsed
+            LookML explores, views, fields, and join metadata.
+
+    Side effects:
+        Renders Streamlit widgets (selectbox, expanders, markdown) into
+        the current sidebar context. Reads from st.session_state keys
+        explorer_explore and explorer_field_type.
+    """
     st.subheader("Graph Explorer")
 
     if not cache:

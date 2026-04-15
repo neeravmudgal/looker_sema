@@ -46,6 +46,9 @@ class ConversationTurn:
     fields_used: Optional[List[str]] = None
     stages: Optional[list] = None          # List of StageInfo dicts for timing display
     total_duration_ms: float = 0.0
+    prompt_log: Optional[list] = None      # Full LLM call log for context display
+    stage_data: Optional[list] = None      # Stage data payloads for context display
+    loop_iterations: Optional[list] = None # Multi-hop iteration data
     timestamp: datetime = dataclass_field(default_factory=datetime.now)
 
 
@@ -68,6 +71,10 @@ class ConversationSession:
         self.pending_retrieval: Optional[RetrievalResult] = None
         self.pending_intent: Optional[dict] = None
         self.pending_user_query: Optional[str] = None
+        # Multi-hop LLM loop state (for Type 2 clarifications from the LLM)
+        self.pending_loop_context: Optional[dict] = None
+        self.pending_iterations: Optional[list] = None
+        self.pending_clarification_source: Optional[str] = None  # "programmatic" | "llm"
         self._token_count: Dict[str, int] = {"input": 0, "output": 0}
 
     def add_turn(self, turn: ConversationTurn) -> None:
@@ -95,6 +102,7 @@ class ConversationSession:
         self.pending_retrieval = retrieval
         self.pending_intent = intent
         self.pending_user_query = user_query
+        self.pending_clarification_source = "programmatic"
         logger.debug("Session %s: set pending (ambiguity: %s)", self.session_id, retrieval.ambiguity_type)
 
     def resolve_pending(self, user_choice: str) -> tuple:
@@ -189,12 +197,50 @@ class ConversationSession:
 
         return result
 
+    def set_pending_clarification(
+        self,
+        result: RetrievalResult,
+        intent: dict,
+        user_query: str,
+        loop_context: dict,
+        iterations: list,
+    ) -> None:
+        """
+        Store state for an LLM-driven clarification (Type 2 response).
+
+        Unlike programmatic ambiguity (set_pending), this stores the full
+        loop context and iteration history. When the user responds, the
+        full pipeline restarts from scratch with the user's answer appended
+        to the original query.
+
+        Args:
+            result: The RetrievalResult at the time of clarification.
+            intent: The structured intent dict.
+            user_query: The original user question.
+            loop_context: The accumulated context dict from the generation loop.
+            iterations: List of LoopIteration dicts from the generation loop.
+        """
+        self.state = "WAITING_FOR_CLARIFICATION"
+        self.pending_retrieval = result
+        self.pending_intent = intent
+        self.pending_user_query = user_query
+        self.pending_loop_context = loop_context
+        self.pending_iterations = iterations
+        self.pending_clarification_source = "llm"
+        logger.debug(
+            "Session %s: set pending LLM clarification (iterations: %d)",
+            self.session_id, len(iterations),
+        )
+
     def clear_pending(self) -> None:
         """Reset all pending state."""
         self.state = "IDLE"
         self.pending_retrieval = None
         self.pending_intent = None
         self.pending_user_query = None
+        self.pending_loop_context = None
+        self.pending_iterations = None
+        self.pending_clarification_source = None
 
     def add_tokens(self, input_tokens: int, output_tokens: int) -> None:
         """Track token usage across the session."""

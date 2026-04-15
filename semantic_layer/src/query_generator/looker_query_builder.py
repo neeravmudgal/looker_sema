@@ -62,6 +62,73 @@ class LookerQueryBuilder:
         self._llm = llm
         self._prompt_template = _load_prompt("query_generation.txt")
 
+    def generate_single_call(
+        self,
+        context: dict,
+        user_query: str,
+        additional_context: str = "",
+    ) -> Optional[dict]:
+        """
+        Execute ONE LLM call with the multi-hop prompt template.
+
+        Returns the raw parsed response dict which may be any of the 3 types:
+        - Type 1 (query): {"response_type": "query", "explore": ..., "fields": ..., ...}
+        - Type 2 (clarification): {"response_type": "clarification", "question": ..., ...}
+        - Type 3 (context_request): {"response_type": "context_request", "search_concept": ..., ...}
+
+        Args:
+            context: The assembled context dict from ContextAssembler.
+            user_query: The original user question.
+            additional_context: Extra context accumulated from previous Type 3 iterations.
+
+        Returns:
+            Parsed response dict, or None if the call fails.
+        """
+        if not self._prompt_template:
+            return None
+
+        try:
+            prompt = Template(self._prompt_template).safe_substitute(
+                explore_name=context.get("explore_name", ""),
+                model_name=context.get("model_name", ""),
+                base_view=context.get("base_view", ""),
+                sql_table=context.get("sql_table", ""),
+                joins_formatted=context.get("joins_formatted", ""),
+                fields_formatted=context.get("fields_formatted", ""),
+                always_filters=context.get("always_filters", "none"),
+                user_query=user_query,
+                intent_json=context.get("intent_json", "{}"),
+                time_filter_value=context.get("time_filter_value", ""),
+            )
+
+            retrieval_hint = context.get("retrieval_hint", "")
+            if retrieval_hint:
+                prompt += f"\n\n## Retrieval Hint\n{retrieval_hint}"
+
+            if additional_context:
+                prompt += f"\n\n{additional_context}"
+
+            system = (
+                "You are a LookML query expert. Generate a Looker Explore query JSON, "
+                "ask a clarification question, or request additional context from the "
+                "data model. Use ONLY fields from the Available Fields list — use their "
+                "exact view_name.field_name format. Return ONLY valid JSON matching one "
+                "of the three response types described in the prompt."
+            )
+
+            response = self._llm.complete_json(system, prompt)
+            if response and isinstance(response, dict):
+                logger.info(
+                    "LLM single call returned response_type='%s'",
+                    response.get("response_type", "unknown"),
+                )
+                return response
+
+        except Exception as exc:
+            logger.warning("LLM single call failed: %s", exc)
+
+        return None
+
     def build(
         self,
         result: RetrievalResult,

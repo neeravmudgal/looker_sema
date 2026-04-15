@@ -60,6 +60,27 @@ class StageInfo:
 
 
 @dataclass
+class LoopIteration:
+    """
+    One iteration of the multi-hop query generation loop.
+
+    Tracks exactly what was sent to and received from the LLM at each step,
+    plus any vector search results appended for Type 3 context requests.
+    All data is exposed to the UI for full transparency.
+    """
+    iteration_number: int
+    response_type: str  # "query" | "clarification" | "context_request"
+    system_prompt: str = ""
+    user_prompt: str = ""
+    raw_response: str = ""
+    parsed_response: dict = dataclass_field(default_factory=dict)
+    additional_context: Optional[str] = None
+    duration_ms: float = 0.0
+    vector_search_query: Optional[str] = None
+    vector_search_results: Optional[List[dict]] = None
+
+
+@dataclass
 class TurnResponse:
     """
     Everything the UI needs to render one assistant response.
@@ -88,6 +109,7 @@ class TurnResponse:
     stages: List[StageInfo] = dataclass_field(default_factory=list)
     total_duration_ms: float = 0.0
     prompt_log: List[dict] = dataclass_field(default_factory=list)
+    loop_iterations: List[dict] = dataclass_field(default_factory=list)
 
 
 # Type alias for the status callback the UI passes in
@@ -164,7 +186,7 @@ class TurnHandler:
             else:
                 response = self._handle_new_query(user_message, session, _notify)
 
-            # Record the assistant's response (including stage timings)
+            # Record the assistant's response (including stage timings and full context)
             session.add_turn(ConversationTurn(
                 role="assistant",
                 content=response.message,
@@ -181,6 +203,8 @@ class TurnHandler:
                     for s in response.stages
                 ],
                 total_duration_ms=response.total_duration_ms,
+                prompt_log=response.prompt_log,
+                loop_iterations=response.loop_iterations if response.loop_iterations else None,
             ))
 
             response.token_count = self._llm.get_token_summary()
@@ -294,35 +318,39 @@ class TurnHandler:
                           "all_candidates_count": len(result._all_candidates),
                       })
 
-        # ── Stage 3: Ambiguity check ─────────────────────────────
+        # ── Stage 3: Ambiguity check (programmatic, conditional) ──
         _stage_notify(3, 4, "Ambiguity Detection", status="running")
         t0 = time.time()
 
-        # Ambiguity is already checked inside retriever, just record timing
-        stage3_ms = (time.time() - t0) * 1000
-        if result.needs_clarification:
-            amb_detail = f"Ambiguity found: {result.ambiguity_type}"
-            stages.append(StageInfo(
-                name="Ambiguity Detection",
-                status="done",
-                duration_ms=stage3_ms,
-                detail=amb_detail,
-            ))
-            _stage_notify(3, 4, "Ambiguity Detection", status="done",
-                          duration_ms=stage3_ms, detail=amb_detail,
-                          data={"type": result.ambiguity_type,
-                                "options": result.clarification_options})
-            # Return clarification — don't proceed to query gen
-            session.set_pending(result, intent, user_message)
-            return TurnResponse(
-                message=result.clarification_question,
-                turn_type="clarification",
-                clarification_options=result.clarification_options,
-                warnings=result.warnings,
-                stages=stages,
-            )
+        if not settings.use_llm_ambiguity:
+            # Legacy programmatic ambiguity detection
+            stage3_ms = (time.time() - t0) * 1000
+            if result.needs_clarification:
+                amb_detail = f"Ambiguity found: {result.ambiguity_type}"
+                stages.append(StageInfo(
+                    name="Ambiguity Detection",
+                    status="done",
+                    duration_ms=stage3_ms,
+                    detail=amb_detail,
+                ))
+                _stage_notify(3, 4, "Ambiguity Detection", status="done",
+                              duration_ms=stage3_ms, detail=amb_detail,
+                              data={"type": result.ambiguity_type,
+                                    "options": result.clarification_options})
+                session.set_pending(result, intent, user_message)
+                return TurnResponse(
+                    message=result.clarification_question,
+                    turn_type="clarification",
+                    clarification_options=result.clarification_options,
+                    warnings=result.warnings,
+                    stages=stages,
+                )
+            amb_detail = "No ambiguity detected" if field_count > 0 else "No fields found"
+        else:
+            # LLM-driven ambiguity — skip programmatic check, let the LLM decide
+            stage3_ms = (time.time() - t0) * 1000
+            amb_detail = "Skipped (LLM-driven ambiguity enabled)"
 
-        amb_detail = "No ambiguity detected" if field_count > 0 else "No fields found"
         stages.append(StageInfo(
             name="Ambiguity Detection",
             status="done",
@@ -339,52 +367,374 @@ class TurnHandler:
                 stages=stages,
             )
 
-        # ── Stage 4: Build query + explanation ────────────────────
+        # ── Stage 4: Multi-hop query generation loop ─────────────
         _stage_notify(4, 4, "Query Generation", status="running")
         t0 = time.time()
 
         context = self._context_assembler.assemble(result, intent)
-        query = self._query_builder.build(result, intent, context, user_message)
 
-        stage4_ms = (time.time() - t0) * 1000
+        if settings.use_llm_ambiguity:
+            # Multi-hop loop: LLM decides if it needs clarification or more context
+            loop_response, iterations = self._run_generation_loop(
+                result, intent, context, user_message, notify,
+            )
 
-        # Extract internal keys
-        all_warnings = list(result.warnings)
-        if query.get("_warnings"):
-            all_warnings.extend(query.pop("_warnings"))
-        query.pop("_confidence", None)
+            stage4_ms = (time.time() - t0) * 1000
+            loop_outcome = loop_response.get("_loop_outcome", "query")
 
-        explanation = query.pop("explanation", "") or self._build_fallback_explanation(result)
+            # Convert iterations to serializable dicts for the UI
+            iterations_data = []
+            for it in iterations:
+                iterations_data.append({
+                    "iteration_number": it.iteration_number,
+                    "response_type": it.response_type,
+                    "system_prompt": it.system_prompt,
+                    "user_prompt": it.user_prompt,
+                    "raw_response": it.raw_response,
+                    "parsed_response": it.parsed_response,
+                    "additional_context": it.additional_context,
+                    "duration_ms": it.duration_ms,
+                    "vector_search_query": it.vector_search_query,
+                    "vector_search_results": it.vector_search_results,
+                })
 
-        query_detail = (
-            f"Fields: {len(query.get('fields', []))}, "
-            f"Filters: {len(query.get('filters', {}))}, "
-            f"Explore: {query.get('explore', '?')}"
+            if loop_outcome == "clarification":
+                # Type 2: LLM wants to ask the user a question
+                question = loop_response.get("question", "Could you clarify your question?")
+                options = loop_response.get("options", [])
+                reason = loop_response.get("reason", "")
+
+                stages.append(StageInfo(
+                    name="Query Generation (Multi-Hop)",
+                    status="done",
+                    duration_ms=stage4_ms,
+                    detail=f"LLM needs clarification ({len(iterations)} iterations). Reason: {reason[:80]}",
+                ))
+
+                # Store state for when user responds
+                session.set_pending_clarification(
+                    result=result,
+                    intent=intent,
+                    user_query=user_message,
+                    loop_context=context,
+                    iterations=iterations_data,
+                )
+
+                return TurnResponse(
+                    message=question,
+                    turn_type="clarification",
+                    clarification_options=options,
+                    warnings=list(result.warnings),
+                    stages=stages,
+                    loop_iterations=iterations_data,
+                )
+
+            # Type 1 or forced query: extract the query
+            query = loop_response
+            query.pop("_loop_outcome", None)
+            query.pop("response_type", None)
+
+            # Validate and normalize
+            query = self._query_builder._normalize_keys(query, result, context)
+            query, validation_warnings = self._query_builder._validate_fields(query, result.explore_name)
+
+            all_warnings = list(result.warnings) + validation_warnings
+
+            if not query.get("fields"):
+                # LLM query failed validation — use direct assembly fallback
+                logger.warning("Multi-hop query had no valid fields, falling back to direct assembly")
+                all_warnings.append("LLM multi-hop query fields were invalid, used direct assembly.")
+                query = self._query_builder._assemble_directly(result, intent, context)
+
+            explanation = query.pop("explanation", "") or self._build_fallback_explanation(result)
+
+            query_detail = (
+                f"Fields: {len(query.get('fields', []))}, "
+                f"Iterations: {len(iterations)}, "
+                f"Explore: {query.get('explore', '?')}"
+            )
+            stages.append(StageInfo(
+                name="Query Generation (Multi-Hop)",
+                status="done",
+                duration_ms=stage4_ms,
+                detail=query_detail,
+            ))
+            _stage_notify(4, 4, "Query Generation", status="done",
+                          duration_ms=stage4_ms, detail=query_detail,
+                          data={"query_fields": query.get("fields", []),
+                                "iterations": len(iterations)})
+
+            query.pop("_warnings", None)
+            query.pop("_confidence", None)
+
+            return TurnResponse(
+                message=explanation,
+                turn_type="answer",
+                query=query,
+                explanation=explanation,
+                warnings=all_warnings,
+                confidence=result.confidence_score,
+                explore_used=result.explore_name,
+                fields_used=query.get("fields", []),
+                stages=stages,
+                loop_iterations=iterations_data,
+            )
+
+        else:
+            # Legacy single-call path
+            query = self._query_builder.build(result, intent, context, user_message)
+            stage4_ms = (time.time() - t0) * 1000
+
+            all_warnings = list(result.warnings)
+            if query.get("_warnings"):
+                all_warnings.extend(query.pop("_warnings"))
+            query.pop("_confidence", None)
+
+            explanation = query.pop("explanation", "") or self._build_fallback_explanation(result)
+
+            query_detail = (
+                f"Fields: {len(query.get('fields', []))}, "
+                f"Filters: {len(query.get('filters', {}))}, "
+                f"Explore: {query.get('explore', '?')}"
+            )
+            stages.append(StageInfo(
+                name="Query Generation",
+                status="done",
+                duration_ms=stage4_ms,
+                detail=query_detail,
+            ))
+            _stage_notify(4, 4, "Query Generation", status="done",
+                          duration_ms=stage4_ms, detail=query_detail,
+                          data={"query_fields": query.get("fields", [])})
+
+            return TurnResponse(
+                message=explanation,
+                turn_type="answer",
+                query=query,
+                explanation=explanation,
+                warnings=all_warnings,
+                confidence=result.confidence_score,
+                explore_used=result.explore_name,
+                fields_used=query.get("fields", []),
+                stages=stages,
+            )
+
+    def _run_generation_loop(
+        self,
+        result: RetrievalResult,
+        intent: dict,
+        context: dict,
+        user_query: str,
+        notify: Callable[[str], None],
+    ) -> tuple:
+        """
+        Multi-hop query generation loop.
+
+        Calls the LLM iteratively until it returns a final query (Type 1),
+        asks for user clarification (Type 2), or exhausts the iteration limit.
+
+        For Type 3 (context_request) responses, the loop performs a vector
+        search for the requested concept, appends results to the context,
+        and calls the LLM again.
+
+        Args:
+            result: RetrievalResult from the retrieval stage.
+            intent: Structured intent dict.
+            context: Assembled context dict from ContextAssembler.
+            user_query: Original user question.
+            notify: Callback for UI progress updates.
+
+        Returns:
+            Tuple of (response_dict, List[LoopIteration]).
+            response_dict has a "_loop_outcome" key:
+              - "query": response_dict is the Looker query
+              - "clarification": response_dict has question/options/reason
+              - "forced_query": max iterations hit, forced a query
+        """
+        max_iters = settings.max_loop_iterations
+        iterations: List[LoopIteration] = []
+        additional_context = ""
+
+        for i in range(max_iters):
+            iter_start = time.time()
+
+            notify(json.dumps({
+                "stage_num": 4,
+                "total_stages": 4,
+                "name": f"Query Generation (Iteration {i + 1})",
+                "status": "running",
+                "timestamp": time.time(),
+                "iteration": i + 1,
+            }))
+
+            response = self._query_builder.generate_single_call(
+                context, user_query, additional_context
+            )
+
+            iter_ms = (time.time() - iter_start) * 1000
+
+            if not response:
+                # LLM call failed entirely — break and use fallback
+                iterations.append(LoopIteration(
+                    iteration_number=i + 1,
+                    response_type="error",
+                    duration_ms=iter_ms,
+                    parsed_response={},
+                ))
+                break
+
+            response_type = response.get("response_type", "query")
+
+            # Capture prompt log for this iteration
+            prompt_log = self._llm.get_prompt_log()
+            last_call = prompt_log[-1] if prompt_log else {}
+
+            iteration = LoopIteration(
+                iteration_number=i + 1,
+                response_type=response_type,
+                system_prompt=last_call.get("system_prompt", ""),
+                user_prompt=last_call.get("user_prompt", ""),
+                raw_response=last_call.get("raw_response", ""),
+                parsed_response=response,
+                additional_context=additional_context if additional_context else None,
+                duration_ms=iter_ms,
+            )
+
+            if response_type == "query":
+                iterations.append(iteration)
+                notify(json.dumps({
+                    "stage_num": 4, "total_stages": 4,
+                    "name": f"Query Generation (Iteration {i + 1})",
+                    "status": "done", "duration_ms": iter_ms,
+                    "detail": f"LLM returned query with {len(response.get('fields', []))} fields",
+                    "iteration": i + 1, "response_type": "query",
+                }))
+                response["_loop_outcome"] = "query"
+                return response, iterations
+
+            elif response_type == "clarification":
+                iterations.append(iteration)
+                notify(json.dumps({
+                    "stage_num": 4, "total_stages": 4,
+                    "name": f"Query Generation (Iteration {i + 1})",
+                    "status": "done", "duration_ms": iter_ms,
+                    "detail": f"LLM needs clarification: {response.get('reason', '')[:80]}",
+                    "iteration": i + 1, "response_type": "clarification",
+                }))
+                response["_loop_outcome"] = "clarification"
+                return response, iterations
+
+            elif response_type == "context_request":
+                search_concept = response.get("search_concept", "")
+                reason = response.get("reason", "")
+
+                # Perform vector search for the requested concept
+                search_results = self._retriever.search_concept(search_concept)
+                iteration.vector_search_query = search_concept
+                iteration.vector_search_results = search_results
+
+                # Format and append results to accumulated context
+                if search_results:
+                    formatted = self._format_search_results(search_concept, search_results)
+                    additional_context += formatted
+                else:
+                    additional_context += (
+                        f"\n\n## Additional Context (Search: '{search_concept}')\n"
+                        f"No additional fields found for '{search_concept}'. "
+                        f"Work with the fields already available."
+                    )
+
+                iterations.append(iteration)
+                notify(json.dumps({
+                    "stage_num": 4, "total_stages": 4,
+                    "name": f"Query Generation (Iteration {i + 1})",
+                    "status": "done", "duration_ms": iter_ms,
+                    "detail": (
+                        f"Context request: '{search_concept}' — "
+                        f"found {len(search_results)} fields"
+                    ),
+                    "iteration": i + 1, "response_type": "context_request",
+                    "data": {
+                        "search_concept": search_concept,
+                        "reason": reason,
+                        "results_count": len(search_results),
+                    },
+                }))
+                logger.info(
+                    "Iteration %d: context_request for '%s' — %d results",
+                    i + 1, search_concept, len(search_results),
+                )
+                continue  # Loop again with enriched context
+
+            else:
+                # Unknown response_type — treat as query
+                iterations.append(iteration)
+                logger.warning(
+                    "Unknown response_type '%s' in iteration %d, treating as query",
+                    response_type, i + 1,
+                )
+                response["_loop_outcome"] = "query"
+                return response, iterations
+
+        # Exhausted all iterations — force a final query
+        logger.warning("Generation loop exhausted %d iterations, forcing query", max_iters)
+        notify(json.dumps({
+            "stage_num": 4, "total_stages": 4,
+            "name": "Query Generation (Forced)",
+            "status": "running", "timestamp": time.time(),
+        }))
+
+        forced_start = time.time()
+        forced_response = self._query_builder.generate_single_call(
+            context, user_query,
+            additional_context + (
+                "\n\n## IMPORTANT: Final Iteration\n"
+                "You MUST return a Type 1 (query) response now. "
+                "Do not request more context or ask clarification questions. "
+                "Use the best information available to build the query."
+            ),
         )
-        stages.append(StageInfo(
-            name="Query Generation",
-            status="done",
-            duration_ms=stage4_ms,
-            detail=query_detail,
-        ))
-        _stage_notify(4, 4, "Query Generation", status="done",
-                      duration_ms=stage4_ms, detail=query_detail,
-                      data={"query_fields": query.get("fields", [])})
+        forced_ms = (time.time() - forced_start) * 1000
 
-        final_query = query
-        fields_used = final_query.get("fields", [])
+        if forced_response and isinstance(forced_response, dict):
+            forced_response["_loop_outcome"] = "forced_query"
+            forced_log = self._llm.get_prompt_log()
+            last_call = forced_log[-1] if forced_log else {}
+            iterations.append(LoopIteration(
+                iteration_number=max_iters + 1,
+                response_type="forced_query",
+                system_prompt=last_call.get("system_prompt", ""),
+                user_prompt=last_call.get("user_prompt", ""),
+                raw_response=last_call.get("raw_response", ""),
+                parsed_response=forced_response,
+                duration_ms=forced_ms,
+            ))
+            notify(json.dumps({
+                "stage_num": 4, "total_stages": 4,
+                "name": "Query Generation (Forced)",
+                "status": "done", "duration_ms": forced_ms,
+                "detail": "Forced query after max iterations",
+            }))
+            return forced_response, iterations
 
-        return TurnResponse(
-            message=explanation,
-            turn_type="answer",
-            query=final_query,
-            explanation=explanation,
-            warnings=all_warnings,
-            confidence=result.confidence_score,
-            explore_used=result.explore_name,
-            fields_used=fields_used,
-            stages=stages,
-        )
+        # Total failure — return empty so the fallback kicks in
+        return {}, iterations
+
+    @staticmethod
+    def _format_search_results(concept: str, results: List[dict]) -> str:
+        """Format vector search results as additional context for the LLM prompt."""
+        lines = [
+            f"\n\n## Additional Context (Search: '{concept}')",
+            f"Found {len(results)} related fields:",
+        ]
+        for r in results[:15]:
+            fqn = f"{r.get('view_name', '?')}.{r.get('field_name', '?')}"
+            ftype = r.get("field_type", "?")
+            dtype = r.get("data_type", "?")
+            desc = r.get("description", "")[:100]
+            score = r.get("score", 0)
+            lines.append(f"  - {fqn} ({ftype}, {dtype}, score={score:.2f}) — {desc}")
+        return "\n".join(lines)
 
     def _handle_clarification_response(
         self,
@@ -395,13 +745,54 @@ class TurnHandler:
         """
         Process a user's response to a clarification question.
 
-        ROUTING BY AMBIGUITY TYPE:
-        - attribution: Re-run retrieval with the attribution_hint set in intent,
-          so scoring picks the right field/explore.
-        - explore_conflict: The user picked an explore directly. Do NOT re-run
-          retrieval (it would just pick the same top-scoring explore again).
-          Instead, re-populate the result from the chosen explore and proceed.
-        - field_collision: The user picked a view. Use resolved result directly.
+        Two paths depending on how the clarification was generated:
+
+        1. LLM-driven (pending_clarification_source == "llm"):
+           Restart the FULL pipeline from scratch, with the user's answer
+           appended to the original query for richer context.
+
+        2. Programmatic (pending_clarification_source == "programmatic"):
+           Legacy behavior — resolve the specific ambiguity type and proceed.
+        """
+        clarification_source = session.pending_clarification_source
+
+        if clarification_source == "llm":
+            return self._handle_llm_clarification_response(user_message, session, notify)
+        else:
+            return self._handle_programmatic_clarification_response(user_message, session, notify)
+
+    def _handle_llm_clarification_response(
+        self,
+        user_message: str,
+        session: ConversationSession,
+        notify: Callable[[str], None],
+    ) -> TurnResponse:
+        """
+        Handle a user's response to an LLM-driven clarification (Type 2).
+
+        Restarts the full pipeline from scratch with the user's answer
+        appended to the original query. This ensures intent extraction,
+        retrieval, and query generation all benefit from the new information.
+        """
+        original_query = session.pending_user_query or ""
+        session.clear_pending()
+
+        # Build an enriched query: original question + user's clarification
+        enriched_query = f"{original_query} (User clarification: {user_message})"
+        notify(f"Restarting pipeline with clarification: {user_message[:50]}...")
+
+        return self._handle_new_query(enriched_query, session, notify)
+
+    def _handle_programmatic_clarification_response(
+        self,
+        user_message: str,
+        session: ConversationSession,
+        notify: Callable[[str], None],
+    ) -> TurnResponse:
+        """
+        Handle a user's response to a programmatic ambiguity detection.
+
+        Legacy behavior for attribution, explore_conflict, field_collision.
         """
         stages: List[StageInfo] = []
         t0 = time.time()
@@ -427,23 +818,18 @@ class TurnHandler:
         ))
 
         if pending_ambiguity_type == "attribution":
-            # Re-run retrieval — the attribution_hint guides field selection
             notify("Re-running retrieval with your choice...")
             t0 = time.time()
             result = self._retriever.retrieve(intent, original_query)
         elif pending_ambiguity_type == "explore_conflict":
-            # User chose an explore — re-populate fields from that explore
-            # but do NOT re-run full retrieval (it would ignore the choice)
             notify("Loading fields from your chosen explore...")
             t0 = time.time()
             chosen_explore = result.explore_name
-            # Re-populate selected_fields from the chosen explore's candidates
             explore_candidates = [
                 c for c in result._all_candidates
                 if c.get("explore_name") == chosen_explore
             ]
             if explore_candidates:
-                # Rebuild selected fields from the cache for this explore
                 ctx = self._retriever._cache.get_explore(chosen_explore)
                 if ctx:
                     from src.parser.models import LookMLField
@@ -453,7 +839,6 @@ class TurnHandler:
                         fqn = f"{c['view_name']}.{c['field_name']}"
                         if fqn not in seen:
                             seen.add(fqn)
-                            # Find the field in cache
                             for f in ctx.get("fields", []):
                                 if f.name == c["field_name"] and f.view_name == c["view_name"]:
                                     result.selected_fields.append(f)
@@ -461,10 +846,10 @@ class TurnHandler:
                     result.model_name = ctx.get("model_name", "")
                     result.joins_needed = ctx.get("joins", [])
         else:
-            # field_collision or other — re-run retrieval with resolved result
             notify("Re-running retrieval with your choice...")
             t0 = time.time()
             result = self._retriever.retrieve(intent, original_query)
+
         stages.append(StageInfo(
             name="Re-retrieval with hint",
             status="done",
@@ -479,7 +864,6 @@ class TurnHandler:
                 stages=stages,
             )
 
-        # Generate query
         notify("Building query + explanation...")
         t0 = time.time()
         context = self._context_assembler.assemble(result, intent)

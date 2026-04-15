@@ -78,6 +78,16 @@ class Settings(BaseSettings):
         description="Number of candidate explores returned by ANN search",
     )
 
+    # ── Multi-Hop LLM Loop ────────────────────────────────────────
+    max_loop_iterations: int = Field(
+        default=5,
+        description="Maximum LLM loop iterations in query generation before forcing a query response",
+    )
+    use_llm_ambiguity: bool = Field(
+        default=True,
+        description="Use LLM-driven ambiguity detection (multi-hop loop) instead of programmatic detection",
+    )
+
     # ── Ollama (local models) ────────────────────────────────────
     ollama_base_url: str = Field(
         default="http://localhost:11434/v1",

@@ -27,7 +27,12 @@ logger = logging.getLogger(__name__)
 
 
 class CircularExtendsError(Exception):
-    """Raised when view inheritance forms a cycle."""
+    """Raised when view inheritance forms a cycle.
+
+    WHY: Circular extends (A extends B extends A) would cause infinite
+    recursion during field merging. Detecting cycles early with a clear
+    error message helps LookML authors fix their declarations.
+    """
     pass
 
 
@@ -84,14 +89,23 @@ def _topological_sort(
     views_with_extends: Dict[str, LookMLView],
     all_views: Dict[str, LookMLView],
 ) -> List[str]:
-    """
-    Topological sort of views by their extends dependencies.
+    """Topological sort of views by their extends dependencies.
 
-    Returns a list of view names in the order they should be resolved
-    (parents before children).
+    WHY: Parents must be fully resolved before their children so that
+    multi-level inheritance (grandparent -> parent -> child) works correctly.
+    Kahn's algorithm also naturally detects cycles.
 
-    Uses Kahn's algorithm (BFS-based) which naturally detects cycles:
-    if any nodes remain after processing, there's a cycle.
+    Args:
+        views_with_extends: Dict of only those views that declare extends.
+        all_views: Dict of all views (needed to look up parent nodes that
+            may not themselves extend anything).
+
+    Returns:
+        List of view names in resolution order (parents before children),
+        filtered to only views that have extends.
+
+    Raises:
+        CircularExtendsError: If any cycle is detected in the dependency graph.
     """
     # Build in-degree map for views that participate in extends
     in_degree: Dict[str, int] = {}
@@ -132,17 +146,21 @@ def _topological_sort(
 
 
 def _merge_parent_into_child(parent: LookMLView, child: LookMLView) -> None:
-    """
-    Merge a parent view's fields and sets into a child view.
+    """Merge a parent view's fields and sets into a child view.
 
-    Rules:
-    - Parent fields are added to the child ONLY if the child doesn't
-      already have a field with the same name (child wins).
-    - Parent sets are merged into child sets (child entries win on collision).
-    - The child's sql_table_name is NOT inherited (Looker behavior).
-    - The child's derived_table_sql is NOT inherited either.
+    WHY: LookML extends means "inherit everything, let me override selectively."
+    This function implements that contract: the child keeps all its own
+    definitions and gains any parent definitions it did not override.
 
-    This mutates the child view in place.
+    Args:
+        parent: The parent view whose fields and sets will be inherited.
+        child: The child view that receives inherited fields and sets.
+
+    Side effects:
+        Mutates child.fields (appends inherited fields) and child.sets
+        (adds missing set entries) in place. Inherited fields are copied
+        with view_name set to the child's name. sql_table_name and
+        derived_table_sql are NOT inherited (matches Looker behavior).
     """
     # Build a set of child field names for fast lookup
     child_field_names: Set[str] = {f.name for f in child.fields}

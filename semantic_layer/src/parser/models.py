@@ -49,23 +49,41 @@ class LookMLField:
 
     @property
     def fully_qualified_name(self) -> str:
-        """view_name.field_name — the format Looker uses in API queries."""
+        """Return the view-qualified field name used in Looker API queries.
+
+        WHY: Looker's API requires fields to be referenced as "view.field"
+        rather than bare field names, since names are only unique within a view.
+
+        Returns:
+            String in the format "view_name.field_name".
+        """
         return f"{self.view_name}.{self.name}"
 
     @property
     def unique_id(self) -> str:
-        """Globally unique within the graph: explore + view + field."""
+        """Return a globally unique identifier for this field within the graph.
+
+        WHY: The same view-level field can appear in multiple explores. This
+        property disambiguates by prepending the explore name, so the knowledge
+        graph can store one node per field-per-explore.
+
+        Returns:
+            String in the format "explore_name::view_name.field_name".
+        """
         return f"{self.explore_name}::{self.view_name}.{self.name}"
 
 
 @dataclass
 class LookMLJoin:
-    """
-    A join relationship between an explore and a view.
+    """A join relationship between an explore and a view.
 
-    sql_on contains the join condition using ${view.field} references.
-    relationship tells us about fanout risk (one_to_many = potential double-counting).
-    fields may restrict which fields from the joined view are accessible.
+    WHY: Joins determine which views (and which fields within those views) are
+    accessible from a given explore. The relationship type also signals fanout
+    risk that downstream query generation must respect.
+
+    WHAT: Stores the join condition (sql_on), cardinality (relationship), join
+    type, and an optional field-set restriction that limits which fields from
+    the joined view are exposed to the explore.
     """
 
     view_name: str = ""
@@ -78,12 +96,17 @@ class LookMLJoin:
 
 @dataclass
 class LookMLView:
-    """
-    A LookML view — either backed by a database table or a derived table (PDT).
+    """A LookML view -- either backed by a database table or a derived table (PDT).
 
-    is_pdt is True when derived_table_sql is populated.
-    extends lists parent view names this view inherits from.
-    sets maps set names to lists of field names (used for field restrictions on joins).
+    WHY: Views are the fundamental unit of field ownership. Every dimension and
+    measure lives inside a view, and explores reference views to assemble their
+    available field sets.
+
+    WHAT: Holds the view's fields, its SQL source (table name or derived SQL),
+    inheritance chain (extends), and named field sets used by join restrictions.
+    is_pdt is True when derived_table_sql is populated. extends lists parent
+    view names this view inherits from. sets maps set names to lists of field
+    names used for field restrictions on joins.
     """
 
     name: str = ""
@@ -98,14 +121,17 @@ class LookMLView:
 
 @dataclass
 class LookMLExplore:
-    """
-    A LookML explore — the top-level query context in Looker.
+    """A LookML explore -- the top-level query context in Looker.
 
-    An explore has one base_view and zero or more joins to other views.
-    Fields are accessible from the base view + all joined views (subject
-    to field set restrictions).
+    WHY: Explores are the entry point for every Looker query. The retrieval
+    layer must know which fields belong to which explore so it can route
+    user questions to the correct query context.
 
-    always_filter: filters that MUST be included in every generated query.
+    WHAT: An explore has one base_view and zero or more joins to other views.
+    Fields are accessible from the base view plus all joined views, subject
+    to field-set restrictions. always_filter stores filters that MUST be
+    included in every generated query. fields_spec holds any top-level
+    fields restriction declared on the explore itself.
     """
 
     name: str = ""
@@ -122,11 +148,16 @@ class LookMLExplore:
 
 @dataclass
 class LookMLModel:
-    """
-    A LookML model file — contains a connection and one or more explores.
+    """A LookML model file -- contains a connection and one or more explores.
 
-    file_path stores the original .lkml file path for debugging and
-    incremental refresh (we can detect when the file changes).
+    WHY: Models are the top-level grouping in Looker. Each model specifies a
+    database connection and the set of explores available through it. The
+    system needs this to map explores back to their connection for query
+    execution.
+
+    WHAT: Holds the model name, database connection string, list of explores,
+    and the original file_path for debugging and incremental refresh (we can
+    detect when the source file changes).
     """
 
     name: str = ""

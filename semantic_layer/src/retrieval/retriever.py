@@ -81,6 +81,32 @@ class Retriever:
         self._embedder = embedder
         self._ambiguity_detector = AmbiguityDetector(cache)
 
+    def search_concept(self, concept: str, top_k: int = 10) -> List[dict]:
+        """
+        Perform a targeted vector search for a specific concept string.
+
+        Called by the multi-hop generation loop when the LLM requests more
+        context (Type 3 response). Embeds the concept string and runs ANN
+        search, returning candidate fields with their descriptions.
+
+        Args:
+            concept: Natural language concept to search for (e.g., "attribution
+                     source fields", "customer lifetime value metrics").
+            top_k: Maximum number of results to return.
+
+        Returns:
+            List of candidate field dicts with field_name, view_name, description,
+            field_type, data_type, score, etc.
+        """
+        try:
+            embedding = self._embedder.embed_query(concept)
+        except Exception as exc:
+            logger.error("Failed to embed concept '%s': %s", concept, exc)
+            return []
+
+        candidates = self._ann_search_fields(embedding)
+        return candidates[:top_k]
+
     def retrieve(self, intent: dict, user_query: str) -> RetrievalResult:
         """Run the full retrieval pipeline."""
         result = RetrievalResult()

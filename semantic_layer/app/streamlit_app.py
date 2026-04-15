@@ -50,9 +50,23 @@ logger = logging.getLogger(__name__)
 
 def initialize_system() -> dict:
     """
-    One-time startup sequence. Cached in st.session_state.
+    One-time startup sequence that bootstraps every backend service.
 
-    Returns a dict with all initialized services, or an error message.
+    WHY: The app needs Neo4j, parsed LookML, embeddings, and an LLM
+    provider before it can answer questions. This function runs all
+    seven setup steps behind a progress bar so the user sees status
+    during the 10-30 second cold start, and is cached in
+    st.session_state so it only executes once per browser session.
+
+    Returns:
+        Dict with keys: ready (bool), error (str or None), driver,
+        cache, embedder, llm, turn_handler, models, views, stats.
+        On failure, only ready=False and error are set.
+
+    Side effects:
+        Renders a Streamlit progress bar during initialization.
+        Connects to Neo4j, drops and rebuilds graph data, calls
+        embedding APIs, and instantiates the LLM provider.
     """
     status = {"ready": False, "error": None, "stats": {}}
 
@@ -166,7 +180,18 @@ def initialize_system() -> dict:
 
 
 def main():
-    """Main app entry point."""
+    """
+    Main app entry point -- wires together sidebar and chat area.
+
+    WHY: Streamlit reruns the entire script on every interaction.
+    This function guards against redundant work by checking
+    st.session_state for already-initialized services before
+    rendering the sidebar settings, graph explorer, and chat UI.
+
+    Side effects:
+        Populates st.session_state.system and st.session_state.conversation
+        on first run. Renders the full page layout on every rerun.
+    """
 
     # ── Initialize once per session ───────────────────────────────
     if "system" not in st.session_state:

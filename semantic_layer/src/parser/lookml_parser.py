@@ -35,7 +35,12 @@ logger = logging.getLogger(__name__)
 
 
 class ParseError(Exception):
-    """Raised when LookML parsing encounters an unrecoverable problem."""
+    """Raised when LookML parsing encounters an unrecoverable problem.
+
+    WHY: Callers need a specific exception type to distinguish parse failures
+    (e.g. missing directory, circular extends) from generic Python errors so
+    they can present user-friendly diagnostics.
+    """
     pass
 
 
@@ -195,11 +200,20 @@ def _build_views(raw_views: Dict[str, dict]) -> Dict[str, LookMLView]:
 
 
 def _parse_field(raw: dict, field_type_key: str, view_name: str) -> Optional[LookMLField]:
-    """
-    Parse a single raw field dict from lkml into a LookMLField object.
+    """Parse a single raw field dict from lkml into a LookMLField object.
 
-    field_type_key is the lkml dict key: "dimensions", "measures",
-    "dimension_groups", "filters", "parameters".
+    WHY: The raw lkml library output uses plural keys ("dimensions", "measures")
+    and LookML-specific boolean strings. This function normalizes everything
+    into a clean LookMLField with Python-native types.
+
+    Args:
+        raw: A single field dict as returned by lkml.load().
+        field_type_key: The lkml dict key this field came from -- one of
+            "dimensions", "measures", "dimension_groups", "filters", "parameters".
+        view_name: Name of the view this field belongs to.
+
+    Returns:
+        A LookMLField, or None if the raw dict has no name.
     """
     name = raw.get("name", "")
     if not name:
@@ -464,19 +478,28 @@ def get_accessible_fields(
     explore: LookMLExplore,
     views: Dict[str, LookMLView],
 ) -> List[LookMLField]:
-    """
-    Determine all fields accessible from a given explore.
+    """Determine all fields accessible from a given explore.
 
-    This is the key function that resolves field visibility:
+    WHY: Not every field defined in a view is queryable from every explore.
+    Joins can restrict visible fields via named sets, and explores can have
+    top-level field restrictions. This function is the single source of truth
+    for field visibility.
 
-    1. Start with base_view fields (all visible unless explore-level fields: restricts)
-    2. For each join, add that view's fields — but if the join has a
-       fields: restriction (e.g. [user_facts*]), only include fields
+    WHAT: Resolves field visibility by:
+    1. Starting with base_view fields (all visible unless explore-level
+       fields: restricts them).
+    2. For each join, adding that view's fields -- but if the join has a
+       fields: restriction (e.g. [user_facts*]), only including fields
        that are members of that named set.
-    3. Set explore_name and model_name on each emitted field.
-    4. Skip fields marked hidden (they'll be in the graph but not in retrieval results).
+    3. Setting explore_name and model_name on each emitted field.
 
-    Returns a new list — does not mutate the original view fields.
+    Args:
+        explore: The explore whose accessible fields we want to resolve.
+        views: Dict mapping view name to LookMLView (fully resolved).
+
+    Returns:
+        A new list of LookMLField copies with explore_name and model_name
+        populated. Does not mutate the original view fields.
     """
     accessible: List[LookMLField] = []
 
@@ -513,7 +536,20 @@ def get_accessible_fields(
 
 
 def _copy_field_for_explore(field: LookMLField, explore: LookMLExplore) -> LookMLField:
-    """Create a copy of a field with explore_name and model_name set."""
+    """Create a copy of a field stamped with an explore's identity.
+
+    WHY: The same physical field appears in multiple explores, but each
+    occurrence needs its own explore_name and model_name so the knowledge
+    graph can distinguish them. Copying avoids mutating the shared view-level
+    field objects.
+
+    Args:
+        field: The source field from a view's field list.
+        explore: The explore this field copy will belong to.
+
+    Returns:
+        A new LookMLField with explore_name and model_name populated.
+    """
     return LookMLField(
         name=field.name,
         field_type=field.field_type,
@@ -583,12 +619,21 @@ def _field_matches_restriction(
     allowed: List[str],
     view: LookMLView,
 ) -> bool:
-    """
-    Check if a field name is in the allowed list.
+    """Check if a field name passes a join's field-set restriction.
 
-    Handles expanded dimension_group fields: if "created_date" is the field
-    and "created" is in the allowed set, it matches (because created is the
-    dimension_group that generates created_date).
+    WHY: Expanded dimension_group fields (e.g. "created_date") are not
+    listed by name in field sets -- only the group name ("created") appears.
+    This function handles the prefix-matching convention so expanded fields
+    are correctly included.
+
+    Args:
+        field_name: The name of the field to check.
+        allowed: List of explicitly allowed field names (from set expansion).
+        view: The view the field belongs to (unused currently, reserved for
+            future pattern matching).
+
+    Returns:
+        True if the field should be included, False otherwise.
     """
     if field_name in allowed:
         return True
@@ -603,7 +648,17 @@ def _field_matches_restriction(
 
 
 def _parse_bool(value: Any) -> bool:
-    """Parse a LookML boolean value (yes/no/true/false)."""
+    """Parse a LookML boolean value into a Python bool.
+
+    WHY: LookML uses "yes"/"no" strings rather than true/false. This helper
+    normalizes all variants so callers can use standard Python booleans.
+
+    Args:
+        value: A bool, string ("yes", "no", "true", "false", "1"), or other type.
+
+    Returns:
+        True if the value represents a truthy LookML value, False otherwise.
+    """
     if isinstance(value, bool):
         return value
     if isinstance(value, str):

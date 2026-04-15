@@ -57,6 +57,14 @@ class ExploreContextCache:
     """
 
     def __init__(self, driver: Driver):
+        """Initialize an empty cache backed by the given Neo4j driver.
+
+        The cache starts empty; call rebuild() to populate it from the graph.
+
+        Args:
+            driver: Active Neo4j driver used to read explore/field data
+                during rebuild().
+        """
         self._driver = driver
         self._lock = threading.RLock()
         self._explore_index: Dict[str, dict] = {}
@@ -213,7 +221,17 @@ class ExploreContextCache:
     def get_field_in_explore(
         self, explore_name: str, view_name: str, field_name: str
     ) -> Optional[LookMLField]:
-        """Look up a specific field in a specific explore."""
+        """Look up a specific field within a specific explore's context.
+
+        Args:
+            explore_name: Name of the explore to search in.
+            view_name: View that owns the field.
+            field_name: Name of the field within the view.
+
+        Returns:
+            The matching LookMLField, or None if the explore or field
+            is not in the cache.
+        """
         with self._lock:
             ctx = self._explore_index.get(explore_name)
             if not ctx:
@@ -233,10 +251,20 @@ class ExploreContextCache:
 
     @property
     def explore_count(self) -> int:
+        """Total number of cached explores (including hidden ones).
+
+        Returns:
+            Count of explores currently in the forward index.
+        """
         with self._lock:
             return len(self._explore_index)
 
     @property
     def field_count(self) -> int:
+        """Total number of cached fields across all explores (including hidden ones).
+
+        Returns:
+            Count of all field objects in the cache.
+        """
         with self._lock:
             return len(self._all_fields)

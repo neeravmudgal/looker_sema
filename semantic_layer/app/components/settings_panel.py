@@ -28,7 +28,28 @@ EMBEDDING_PROVIDERS = {
 
 
 def render_settings_panel(system: dict, session) -> None:
-    """Render the full sidebar settings panel."""
+    """
+    Render the full sidebar settings panel.
+
+    WHY: Operators need runtime control over which LLM provider/model is
+    used and visibility into system health without restarting the app.
+    This panel exposes provider switching, debug toggles, system stats,
+    and session management (export / clear).
+
+    Args:
+        system: The shared system dict from st.session_state containing
+            driver, cache, embedder, llm, turn_handler, stats, and the
+            ready/error flags set during startup.
+        session: The current ConversationSession tracking turns, token
+            counts, and chat history for this browser session.
+
+    Side effects:
+        Renders Streamlit widgets into the current sidebar context.
+        May hot-swap the LLM provider and recreate the TurnHandler in
+        system dict when the user changes the provider or model dropdown.
+        The "Clear Chat" button replaces st.session_state.conversation
+        with a fresh ConversationSession and triggers st.rerun().
+    """
 
     # ── LLM Settings ─────────────────────────────────────────────
     st.subheader("LLM Settings")
@@ -62,6 +83,15 @@ def render_settings_panel(system: dict, session) -> None:
                 system["driver"], system["cache"],
                 system["embedder"], system["llm"],
             )
+
+    # ── Debug & Context Display ─────────────────────────────────
+    st.subheader("Debug")
+    st.checkbox(
+        "Show full LLM context in chat",
+        key="show_full_context",
+        value=True,
+        help="When enabled, shows the complete system prompt, user prompt, and raw LLM response for every call inline in the chat.",
+    )
 
     # ── System Status ────────────────────────────────────────────
     st.subheader("System Status")

@@ -49,6 +49,19 @@ class Embedder:
     """
 
     def __init__(self, driver: Driver, provider: str = "", model: str = ""):
+        """
+        Initialize the embedding service.
+
+        WHY: Defers API client creation until first use so that construction
+        is cheap and tests can instantiate without valid API keys.
+
+        Args:
+            driver: Neo4j driver for reading/writing embedding vectors on nodes.
+            provider: Embedding provider name ("openai", "google", "ollama").
+                Falls back to settings.embedding_provider if empty.
+            model: Model identifier (e.g. "text-embedding-3-small").
+                Falls back to settings.embedding_model if empty.
+        """
         self._driver = driver
         self._provider = provider or settings.embedding_provider
         self._model = model or settings.embedding_model
@@ -314,7 +327,17 @@ class Embedder:
         field_keys: List[dict],
         embeddings: List[List[float]],
     ) -> None:
-        """Write embedding vectors back to Field nodes in Neo4j."""
+        """
+        Write embedding vectors back to Field nodes in Neo4j.
+
+        Args:
+            field_keys: List of dicts with keys name, view_name, explore_name, text_hash.
+            embeddings: Parallel list of float vectors to store.
+
+        Side effects:
+            Sets embedding and embedding_hash properties on matched Field nodes,
+            batched in chunks of 100 to avoid transaction size limits.
+        """
         with self._driver.session() as session:
             # Batch update in chunks
             chunk_size = 100
@@ -344,7 +367,16 @@ class Embedder:
         explore_keys: List[dict],
         embeddings: List[List[float]],
     ) -> None:
-        """Write embedding vectors back to Explore nodes in Neo4j."""
+        """
+        Write embedding vectors back to Explore nodes in Neo4j.
+
+        Args:
+            explore_keys: List of dicts with keys name, model_name, text_hash.
+            embeddings: Parallel list of float vectors to store.
+
+        Side effects:
+            Sets embedding and embedding_hash properties on matched Explore nodes.
+        """
         with self._driver.session() as session:
             batch = []
             for i, key in enumerate(explore_keys):
@@ -370,7 +402,16 @@ class Embedder:
         view_keys: List[dict],
         embeddings: List[List[float]],
     ) -> None:
-        """Write embedding vectors back to View nodes in Neo4j."""
+        """
+        Write embedding vectors back to View nodes in Neo4j.
+
+        Args:
+            view_keys: List of dicts with keys name, text_hash.
+            embeddings: Parallel list of float vectors to store.
+
+        Side effects:
+            Sets embedding and embedding_hash properties on matched View nodes.
+        """
         with self._driver.session() as session:
             batch = []
             for i, key in enumerate(view_keys):
@@ -391,7 +432,16 @@ class Embedder:
             )
 
     def get_embedding_stats(self) -> Dict[str, int]:
-        """How many nodes have embeddings vs total."""
+        """
+        Query Neo4j for embedding coverage statistics.
+
+        WHY: The settings panel and health checks need to show how many
+        nodes have been embedded vs total, to detect incomplete runs.
+
+        Returns:
+            Dict with keys: fields_with_embeddings, total_fields,
+            explores_with_embeddings, total_explores.
+        """
         stats = {}
         with self._driver.session() as session:
             r = session.run("MATCH (f:Field) WHERE f.embedding IS NOT NULL RETURN count(f) AS c")
